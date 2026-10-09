@@ -797,7 +797,8 @@ class SettingsForm : Form
              cRem = new CheckBox(), cDescr = new CheckBox(), cLog = new CheckBox();
     FlatCombo cDelim = new FlatCombo(), cCsvEnc = new FlatCombo(), cTheme = new FlatCombo();
     TextBox tMark = new TextBox(), tTpl = new TextBox();
-    TextBox tAiUrl = new TextBox(), tAiKey = new TextBox(), tAiModel = new TextBox(), tAiStyle = new TextBox(), tRules = new TextBox();
+    TextBox tAiUrl = new TextBox(), tAiKey = new TextBox(), tAiStyle = new TextBox(), tRules = new TextBox();
+    ComboBox tAiModel = new ComboBox(); FlatCombo cPreset = new FlatCombo(); Label lPre; LinkLabel lKey; bool presetBusy;
     NumericUpDown nAiBatch = new NumericUpDown(), nAiMax = new NumericUpDown(), nAiTimeout = new NumericUpDown();
     CheckBox cAiDef = new CheckBox();
     TableLayoutPanel tl;
@@ -866,10 +867,33 @@ class SettingsForm : Form
         Note("Пусто — папка templates рядом с программой. Файл настроек: " + Path.Combine(App.Dir, "loginchanger.ini"));
 
         Section("Описания объектов и ИИ");
+        cPreset.Width = 420; cPreset.Items.Add("— выберите сервис, чтобы подставить настройки —");
+        foreach (var p in AiPresets.All) cPreset.Items.Add(p.Name);
+        cPreset.SelectedIndex = 0; Row("Готовые настройки:", cPreset);
+        lPre = Note("");
+        lKey = new LinkLabel { Text = "Где взять ключ API (откроется страница сервиса)", AutoSize = true, Visible = false };
+        lKey.LinkClicked += delegate { try { string k = lKey.Tag as string; if (k != null) System.Diagnostics.Process.Start(k); } catch { } };
+        Row("", lKey);
+        cPreset.SelectedIndexChanged += delegate { if (!presetBusy) ApplyPreset(cPreset.SelectedIndex - 1, true); };
         tAiUrl.Width = 420; Row("Адрес сервиса ИИ:", tAiUrl);
+        tAiUrl.TextChanged += delegate { if (presetBusy) return; int i = AiPresets.IndexOfUrl(tAiUrl.Text); presetBusy = true; cPreset.SelectedIndex = i + 1; presetBusy = false; ApplyPreset(i, false); };
         Note("Любой OpenAI-совместимый: https://api.openai.com/v1 · http://localhost:11434/v1 (Ollama) · http://localhost:1234/v1 (LM Studio). Для локальных адресов подтверждение отправки не спрашивается.");
         tAiKey.Width = 420; tAiKey.UseSystemPasswordChar = true; Row("Ключ API:", tAiKey);
-        tAiModel.Width = 300; Row("Модель:", tAiModel);
+        tAiModel.DropDownStyle = ComboBoxStyle.DropDown; tAiModel.Dock = DockStyle.Fill;
+        var pm = new Panel { Height = 32, MinimumSize = new Size(0, 32), Width = 420 };
+        var bModels = new Button { Text = "Список моделей", Dock = DockStyle.Right, Width = 140 }; pm.Controls.Add(tAiModel); pm.Controls.Add(bModels);
+        bModels.Click += delegate
+        {
+            ApplyToCfg(); Cursor = Cursors.WaitCursor; bModels.Enabled = false;
+            try
+            {
+                var l = Ai.ListModels(); string cur = tAiModel.Text; tAiModel.Items.Clear(); foreach (string m in l) tAiModel.Items.Add(m); tAiModel.Text = cur;
+                UI.Info("Моделей у сервиса: " + l.Count + ". Выберите нужную в выпадающем списке.");
+            }
+            catch (Exception ex) { UI.Warn(ex.Message); }
+            finally { bModels.Enabled = true; Cursor = Cursors.Default; }
+        };
+        Row("Модель:", pm);
         nAiBatch.Minimum = 1; nAiBatch.Maximum = 50; nAiBatch.Width = 80; Row("Объектов в одном запросе:", nAiBatch);
         cAiDef.Text = "Отправлять тексты определений (SQL) — точнее описание, но виден код отчётов"; CheckRow(cAiDef);
         nAiMax.Minimum = 60; nAiMax.Maximum = 500; nAiMax.Width = 80; Row("Максимальная длина описания:", nAiMax);
@@ -908,6 +932,24 @@ class SettingsForm : Form
         FormClosed += delegate { if (DialogResult != DialogResult.OK) Cfg.Load(); };   // отмена — возвращаем сохранённые значения
         LoadValues();
         Theme.Apply(this);
+        lKey.LinkColor = Theme.Accent; lKey.ActiveLinkColor = Theme.Accent; lKey.VisitedLinkColor = Theme.Accent;
+    }
+
+    // подставляет адрес и список моделей выбранного сервиса; fill=false — только показать пояснение к уже введённому адресу
+    void ApplyPreset(int i, bool fill)
+    {
+        if (i < 0) { lPre.Text = ""; lKey.Visible = false; return; }
+        var p = AiPresets.All[i]; presetBusy = true;
+        if (fill)
+        {
+            tAiUrl.Text = p.Url; string cur = tAiModel.Text.Trim();
+            tAiModel.Items.Clear(); foreach (string m in p.Models) tAiModel.Items.Add(m);
+            if (cur.Length == 0 || Array.IndexOf(p.Models, cur) < 0) tAiModel.Text = p.Models.Length > 0 ? p.Models[0] : "";
+        }
+        else if (tAiModel.Items.Count == 0) foreach (string m in p.Models) tAiModel.Items.Add(m);
+        string host = p.Url; try { host = new Uri(p.Url).Host; } catch { }
+        lPre.Text = p.Note + (p.Local ? "" : "\nДанные (имена объектов, столбцы и при включённой настройке определения) будут отправляться на серверы «" + host + "».");
+        lKey.Tag = p.KeyUrl; lKey.Visible = p.KeyUrl != null; presetBusy = false;
     }
 
     static CheckBox[] PermBoxes(string[] all)
@@ -945,11 +987,12 @@ class SettingsForm : Form
         c.AutoSize = true; c.Margin = new Padding(3, 6, 3, 6);
         tl.Controls.Add(c, 0, r); tl.SetColumnSpan(c, 2);
     }
-    void Note(string text)
+    Label Note(string text)
     {
         int r = tl.RowCount++;
         var l = new Label { Text = text, AutoSize = true, MaximumSize = new Size(640, 0), Tag = "muted", Margin = new Padding(3, 4, 3, 6) };
         tl.Controls.Add(l, 0, r); tl.SetColumnSpan(l, 2);
+        return l;
     }
 
     static void Mark(CheckBox[] boxes, List<string> perms) { for (int i = 0; i < boxes.Length; i++) boxes[i].Checked = i == 0 || perms.Contains(boxes[i].Text); }
@@ -1260,7 +1303,10 @@ static class Ai
     }
 
     // возвращает текст ответа модели; бросает исключение с понятным сообщением
-    public static string Chat(string system, string user, CancellationToken ct)
+    public static string Chat(string system, string user, CancellationToken ct) { return Chat(system, user, ct, true); }
+
+    // adapter: часть моделей (например, новые у OpenAI) принимает только температуру по умолчанию — тогда повторяем без неё
+    static string Chat(string system, string user, CancellationToken ct, bool useTemp)
     {
         if (Cfg.AiUrl.Trim().Length == 0) throw new Exception("Не задан адрес сервиса ИИ (Настройки → Описания и ИИ).");
         if (Cfg.AiModel.Trim().Length == 0) throw new Exception("Не задана модель (Настройки → Описания и ИИ).");
@@ -1268,7 +1314,7 @@ static class Ai
         System.Net.ServicePointManager.Expect100Continue = false;
         var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
         var body = new Dictionary<string, object>();
-        body["model"] = Cfg.AiModel.Trim(); body["temperature"] = 0.2;
+        body["model"] = Cfg.AiModel.Trim(); if (useTemp) body["temperature"] = 0.2;
         body["messages"] = new object[] {
             new Dictionary<string, object> { { "role", "system" }, { "content", system } },
             new Dictionary<string, object> { { "role", "user" }, { "content", user } } };
@@ -1295,6 +1341,7 @@ static class Ai
                     using (var sr = new StreamReader(hr.GetResponseStream(), Encoding.UTF8)) { string t = sr.ReadToEnd(); detail = (int)hr.StatusCode + " " + hr.StatusDescription + ": " + (t.Length > 400 ? t.Substring(0, 400) : t); }
                 }
                 catch { }
+            if (useTemp && detail.StartsWith("400") && detail.ToLower().Contains("temperature")) return Chat(system, user, ct, false);
             throw new Exception("Сервис ИИ вернул ошибку: " + detail);
         }
         var root = ser.DeserializeObject(resp) as Dictionary<string, object>;
@@ -1303,6 +1350,31 @@ static class Ai
         if (choices == null || choices.Length == 0) throw new Exception("Сервис ИИ вернул пустой ответ.");
         var msg = ((Dictionary<string, object>)choices[0])["message"] as Dictionary<string, object>;
         return msg != null && msg.ContainsKey("content") ? Convert.ToString(msg["content"]) : "";
+    }
+
+    // список моделей у сервиса: GET {адрес}/models (стандарт OpenAI, поддерживают Ollama, LM Studio, OpenRouter, Groq и др.)
+    public static List<string> ListModels()
+    {
+        if (Cfg.AiUrl.Trim().Length == 0) throw new Exception("Сначала укажите адрес сервиса.");
+        try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)(3072 | 768 | 192); } catch { }
+        string u = Cfg.AiUrl.Trim().TrimEnd('/');
+        if (u.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)) u = u.Substring(0, u.Length - "/chat/completions".Length);
+        var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(u + "/models");
+        req.Method = "GET"; req.Accept = "application/json"; req.Timeout = Math.Min(Cfg.AiTimeout, 30) * 1000; req.UserAgent = "LoginChanger";
+        if (Cfg.AiKey.Length > 0) req.Headers["Authorization"] = "Bearer " + Cfg.AiKey;
+        string resp;
+        try { using (var r = (System.Net.HttpWebResponse)req.GetResponse()) using (var sr = new StreamReader(r.GetResponseStream(), Encoding.UTF8)) resp = sr.ReadToEnd(); }
+        catch (System.Net.WebException ex)
+        {
+            string detail = ex.Message;
+            if (ex.Response != null) try { var hr = (System.Net.HttpWebResponse)ex.Response; detail = (int)hr.StatusCode + " " + hr.StatusDescription; } catch { }
+            throw new Exception("Не удалось получить список моделей: " + detail);
+        }
+        var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+        var root = ser.DeserializeObject(resp) as Dictionary<string, object>; var res = new List<string>();
+        object data; if (root == null || !root.TryGetValue("data", out data)) throw new Exception("Сервис не вернул список моделей в стандартном формате.");
+        foreach (object o in (object[])data) { var d = o as Dictionary<string, object>; if (d != null && d.ContainsKey("id")) { string id = Convert.ToString(d["id"]); if (id.StartsWith("models/")) id = id.Substring(7); res.Add(id); } }
+        res.Sort(StringComparer.OrdinalIgnoreCase); return res;
     }
 
     // из ответа модели достаём {"имя": "описание"} (допускаем обрамление ```json и пояснения вокруг)
@@ -1813,6 +1885,38 @@ class DescriptionsTab : Panel
     }
 }
 
+// ===== готовые настройки популярных ИИ-сервисов (все — OpenAI-совместимые) =====
+class AiPreset
+{
+    public string Name, Url, KeyUrl, Note; public string[] Models; public bool Local;
+    public AiPreset(string name, string url, string[] models, bool local, string keyUrl, string note) { Name = name; Url = url; Models = models; Local = local; KeyUrl = keyUrl; Note = note; }
+}
+static class AiPresets
+{
+    const string Cloud = "Названия моделей меняются: нажмите «Список моделей», чтобы получить актуальные прямо у сервиса.";
+    public static readonly AiPreset[] All = {
+        new AiPreset("Ollama (локально)", "http://localhost:11434/v1", new[] { "qwen2.5:14b", "qwen2.5:7b", "llama3.1:8b", "gemma2:9b", "mistral:7b" }, true, null,
+            "Установите Ollama и скачайте модель, например: ollama pull qwen2.5:14b. Ключ не нужен. Данные не покидают компьютер."),
+        new AiPreset("LM Studio (локально)", "http://localhost:1234/v1", new[] { "local-model" }, true, null,
+            "В LM Studio загрузите модель и запустите локальный сервер (вкладка Developer). Ключ не нужен. Данные не покидают компьютер."),
+        new AiPreset("llama.cpp / vLLM (локально)", "http://localhost:8080/v1", new[] { "local-model" }, true, null,
+            "Адрес по умолчанию у llama.cpp server — 8080 (у vLLM обычно 8000). Ключ не нужен. Данные не покидают компьютер."),
+        new AiPreset("OpenAI", "https://api.openai.com/v1", new[] { "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1" }, false, "https://platform.openai.com/api-keys", Cloud),
+        new AiPreset("Anthropic Claude", "https://api.anthropic.com/v1", new[] { "claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5" }, false, "https://console.anthropic.com/settings/keys",
+            "Работает через слой совместимости Anthropic с OpenAI API. " + Cloud),
+        new AiPreset("Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", new[] { "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash" }, false, "https://aistudio.google.com/apikey",
+            "Работает через слой совместимости Google с OpenAI API. " + Cloud),
+        new AiPreset("OpenRouter (много моделей)", "https://openrouter.ai/api/v1", new[] { "openai/gpt-4o-mini", "google/gemini-2.5-flash", "meta-llama/llama-3.3-70b-instruct", "deepseek/deepseek-chat" }, false, "https://openrouter.ai/keys",
+            "Один ключ для сотен моделей разных провайдеров. " + Cloud),
+        new AiPreset("Groq (быстро)", "https://api.groq.com/openai/v1", new[] { "llama-3.3-70b-versatile", "llama-3.1-8b-instant" }, false, "https://console.groq.com/keys", Cloud),
+        new AiPreset("DeepSeek", "https://api.deepseek.com/v1", new[] { "deepseek-chat" }, false, "https://platform.deepseek.com/api_keys", Cloud),
+        new AiPreset("Mistral", "https://api.mistral.ai/v1", new[] { "mistral-small-latest", "mistral-large-latest" }, false, "https://console.mistral.ai/api-keys", Cloud),
+        new AiPreset("xAI Grok", "https://api.x.ai/v1", new[] { "grok-3-mini", "grok-3" }, false, "https://console.x.ai", Cloud),
+        new AiPreset("Together AI", "https://api.together.xyz/v1", new[] { "meta-llama/Llama-3.3-70B-Instruct-Turbo" }, false, "https://api.together.ai/settings/api-keys", Cloud),
+    };
+    static string N(string u) { return (u ?? "").Trim().TrimEnd('/').ToLowerInvariant(); }
+    public static int IndexOfUrl(string url) { for (int i = 0; i < All.Length; i++) if (N(All[i].Url) == N(url)) return i; return -1; }
+}
 // ===== тема =====
 static class Theme
 {
