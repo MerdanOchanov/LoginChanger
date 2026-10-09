@@ -20,7 +20,7 @@
 <p style="color:var(--muted);font-size:18px;margin-top:0">Полное руководство с пошаговыми скриншотами. Красные номера на картинках соответствуют описанию под ними.</p>
 
 <div class="toc">
-  <a href="#start">1. Запуск и требования</a><a href="#connect">2. Подключение к серверу</a>
+  <a href="#start">1. Запуск и требования</a><a href="#connect">2. Подключение к серверу</a><a href="#engines">2а. Firebird и MySQL</a>
   <a href="#overview">3. Главное окно</a><a href="#users">4. Вкладка «Пользователи»</a>
   <a href="#create">5. Создание пользователя</a><a href="#bulk">6. Массовое создание</a>
   <a href="#orphan">7. «Сироты» и логины без базы</a><a href="#matrix">8. Матрица прав</a>
@@ -34,8 +34,8 @@
 <h2 id="start">1. Запуск и требования</h2>
 <ul>
   <li><strong>Windows:</strong> 7 SP1, 10, 11 или Server 2019. Нужен .NET Framework 4.0 или новее (в Windows 10/11 уже установлен).</li>
-  <li><strong>SQL Server:</strong> 2012–2022. Нужен вход администратора: через Windows-аутентификацию или логином <code>sa</code>.</li>
-  <li><strong>Установка не требуется.</strong> Скопируйте <code>LoginChanger.exe</code> в любую папку (или на флешку) и запустите. Дополнительные драйверы не нужны.</li>
+  <li><strong>SQL Server:</strong> 2012–2022. Нужен вход администратора: через Windows-аутентификацию или логином <code>sa</code>. <strong>Firebird</strong> 3+ и <strong>MySQL</strong> 8 — через установленный ODBC-драйвер, вход администратором СУБД.</li>
+  <li><strong>Установка не требуется.</strong> Скопируйте <code>LoginChanger.exe</code> в любую папку (или на флешку) и запустите. Для SQL Server дополнительные драйверы не нужны.</li>
   <li>Рядом с программой создаются: <code>logs\</code> (журнал по дням), <code>templates\</code> (шаблоны прав), <code>loginchanger.ini</code> (сервер, база, тема; без паролей).</li>
 </ul>
 
@@ -55,6 +55,26 @@
   <li><b>2</b><span><strong>Выбрать базу.</strong> Открывает главное окно. Если вы измените сервер, логин или пароль, выбор базы снова скроется.</span></li>
 </ul>
 <div class="note">Если вы вошли не как sysadmin, программа предупредит: часть действий (создание логинов) может быть недоступна.</div>
+
+<h2 id="engines">2а. Firebird и MySQL</h2>
+<p>На экране подключения выберите СУБД. Для Firebird и MySQL используются ODBC-драйверы, уже установленные в Windows; нужный драйвер подставляется автоматически (для MySQL предпочтительно Unicode-вариант).</p>
+<figure class="shot"><img src="img/conn_fb.png" alt="Подключение к Firebird" width="540" height="700" style="margin:auto"></figure>
+<ul class="legend">
+  <li><b>1</b><span><strong>СУБД:</strong> SQL Server, Firebird (ODBC) или MySQL / MariaDB (ODBC).</span></li>
+  <li><b>2</b><span><strong>Драйвер ODBC.</strong> Выбирается из установленных; если пусто — установите драйвер (Firebird ODBC или MySQL Connector/ODBC той же разрядности, что и система).</span></li>
+  <li><b>3</b><span><strong>Файл базы</strong> (только Firebird) — путь к <code>.fdb</code> <u>на сервере</u>, например <code>C:\Data\clinic.fdb</code>. Сервер можно указать как <code>хост</code> или <code>хост:порт</code>.</span></li>
+  <li><b>4</b><span><strong>Подключиться.</strong> Логин и пароль — администратора СУБД (<code>SYSDBA</code> для Firebird, <code>root</code> для MySQL).</span></li>
+</ul>
+<p>Дальше всё работает так же, как в SQL Server: вкладки «Пользователи», «Представления», «Функции и процедуры», «Таблицы». У MySQL после входа выбирается база (системные скрыты), у Firebird база — это файл, поэтому появляется только кнопка «Открыть базу».</p>
+<figure class="shot"><img src="img/users_fb.png" alt="Пользователи Firebird" width="1260" height="840" loading="lazy"></figure>
+<ul class="legend"><li><b>1</b><span>Создание пользователя сервера с паролем и правами по шаблону.</span></li><li><b>2</b><span>Массовое создание.</span></li><li><b>3</b><span>«Права как у…».</span></li><li><b>4</b><span>Статус: администраторы защищены.</span></li></ul>
+<figure class="shot"><img src="img/matrix_my.png" alt="Матрица прав MySQL" width="1260" height="840" loading="lazy"></figure>
+<div class="note"><strong>Особенности:</strong>
+<ul style="margin:6px 0 0"><li><strong>Пользователи общие для сервера</strong> (в Firebird — в базе безопасности, в MySQL — <code>mysql.user</code>); права показываются для выбранной базы.</li>
+<li><strong>Администраторы скрыты:</strong> Firebird — <code>SYSDBA</code> и пользователи с ролью администратора; MySQL — <code>root</code>, служебные учётные записи и все, у кого есть <code>SUPER</code> или <code>GRANT OPTION</code>.</li>
+<li><strong>MySQL:</strong> имена пишутся <code>имя</code> или <code>имя@хост</code> (по умолчанию <code>@%</code>). Команды <code>GRANT</code>/<code>REVOKE</code> в MySQL фиксируются сразу, поэтому вместо транзакции программа при ошибке выполняет обратные команды для уже применённых.</li>
+<li>В матрице видны только явные права на объекты (<code>GRANT … ON объект</code>); права «на всю базу» не отображаются.</li>
+<li>Нет понятий «сирота», «логин без базы» и DENY — они есть только в SQL Server.</li></ul></div>
 
 <h2 id="overview">3. Главное окно</h2>
 <p>Сверху — сервер, база и текущий пользователь, кнопки «Сменить сервер / БД» и «Тема». Ниже четыре вкладки: <strong>Пользователи</strong>, <strong>Представления (SELECT)</strong>, <strong>Функции и процедуры (EXECUTE)</strong>, <strong>Таблицы (SELECT)</strong>. Внизу — журнал действий.</p>
@@ -204,6 +224,7 @@
 <details><summary>«Не удалось получить сведения о пользователе или группе Windows (0x534)»</summary><p>Учётной записи Windows, на которую создан логин, больше нет. Программа обрабатывает такие логины без ошибок; для починки используйте «Починить сироту» — привяжите пользователя к другому логину Windows или удалите его из базы.</p></details>
 <details><summary>Не находится сервер кнопкой «Найти»</summary><p>Сетевой поиск требует запущенной службы <em>SQL Server Browser</em> на сервере и открытого UDP-порта 1434. Введите адрес вручную: <code>сервер\экземпляр</code> или <code>сервер,порт</code>.</p></details>
 <details><summary>Пароль не принимается сервером</summary><p>Политика паролей сервера может быть строже. Включите «Не проверять сложность пароля сервером» в окне создания либо задайте свой пароль.</p></details>
+<details><summary>«ODBC-драйвер не найден» (Firebird / MySQL)</summary><p>Установите драйвер: Firebird ODBC (с firebirdsql.org) или MySQL Connector/ODBC (с mysql.com). Разрядность драйвера должна совпадать с разрядностью программы (на 64-разрядной Windows — 64-разрядный драйвер).</p></details>
 <details><summary>Нет столбца какого-то пользователя</summary><p>Возможно, он администратор (sysadmin / db_owner) — такие скрыты намеренно, либо стоит фильтр «Список пользователей».</p></details>
 <details><summary>Окно не помещается / мелкий шрифт</summary><p>Программа учитывает масштаб Windows (DPI). Растяните окно — панели перестроятся.</p></details>
 </main>

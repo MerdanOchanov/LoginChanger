@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Sql;
+using System.Data.Common;
 using System.Data.SqlClient;
 using System.Drawing;
 using System.IO;
@@ -60,6 +61,7 @@ static class App
 
     public static string Q(string n) { return "[" + n.Replace("]", "]]") + "]"; }
     public static string L(string s) { return "N'" + s.Replace("'", "''") + "'"; }
+    public static string S(string s) { return "'" + s.Replace("'", "''") + "'"; }   // строковый литерал (Firebird и др.)
 
     // 8 символов: легко вводить (без 0/O/1/l/I), есть заглавная, строчные и цифры — проходит политику Windows
     public static string GenPwd(int n)
@@ -192,24 +194,35 @@ static class UI
 // ===== работа с БД =====
 class Db
 {
-    public SqlConnection C;
-    public SqlTransaction Tx;
+    public DbConnection C;
+    public DbTransaction Tx;
     public string Server, Name, Who;
+    public string Kind = "mssql";      // mssql | firebird | mysql
+    public Dialect D = new MssqlDialect();
+    public Db() { D.Bind(this); }
 
-    SqlCommand Cmd(string sql, object[] p)
+    DbCommand Cmd(string sql, object[] p)
     {
-        var c = new SqlCommand(sql, C);
-        c.CommandTimeout = 60;
-        c.Transaction = Tx;
+        var c = C.CreateCommand();
+        c.CommandText = sql; c.CommandTimeout = 60; c.Transaction = Tx;
         for (int i = 0; p != null && i + 1 < p.Length; i += 2)
-            c.Parameters.AddWithValue((string)p[i], p[i + 1] ?? DBNull.Value);
+        {
+            var q = c.CreateParameter(); q.ParameterName = (string)p[i]; q.Value = p[i + 1] ?? DBNull.Value; c.Parameters.Add(q);
+        }
         return c;
+    }
+    // читаем строки вручную: DataTable.Load падает на ограничениях, которые сообщают некоторые ODBC-драйверы
+    static DataTable Read(IDataReader r)
+    {
+        var t = new DataTable();
+        for (int i = 0; i < r.FieldCount; i++) t.Columns.Add(r.GetName(i), typeof(object));
+        var vals = new object[r.FieldCount];
+        while (r.Read()) { r.GetValues(vals); t.Rows.Add(vals); }
+        return t;
     }
     public DataTable Query(string sql, params object[] p)
     {
-        var dt = new DataTable();
-        using (var c = Cmd(sql, p)) using (var a = new SqlDataAdapter(c)) a.Fill(dt);
-        return dt;
+        using (var c = Cmd(sql, p)) using (var r = c.ExecuteReader()) return Read(r);
     }
     public int Count(string sql, params object[] p)
     {
@@ -239,26 +252,8 @@ class Db
     {
         return Count("SELECT COUNT(*) FROM sys.database_role_members rm JOIN sys.database_principals r ON r.principal_id=rm.role_principal_id AND r.name='db_owner' JOIN sys.database_principals m ON m.principal_id=rm.member_principal_id WHERE m.name=@n", "@n", user) > 0;
     }
-    public DataTable Users()
-    {
-        DataTable t = Query(App.UsersSql);
-        foreach (DataRow r in t.Rows)
-        {
-            string lt = r["lt"] as string, lg = r["lg"] as string;
-            if (Convert.ToInt32(r["prot"]) == 0 && lg != null && (lt == "U" || lt == "G") && IsSysadmin(lg)) r["prot"] = 1;
-        }
-        return t;
-    }
-    public DataTable Logins()
-    {
-        DataTable t = Query(App.LoginsSql);
-        for (int i = t.Rows.Count - 1; i >= 0; i--)
-        {
-            string tp = t.Rows[i]["tp"] as string;
-            if ((tp == "U" || tp == "G") && IsSysadmin((string)t.Rows[i]["nm"])) t.Rows.RemoveAt(i);
-        }
-        return t;
-    }
+    public DataTable Users() { return D.Users(); }
+    public DataTable Logins() { return D.Logins(); }
 
     public void InTx(Action a)
     {
@@ -267,6 +262,289 @@ class Db
         catch { try { Tx.Rollback(); } catch { } App.Log("Ошибка, транзакция отменена"); throw; }
         finally { Tx = null; }
     }
+
+    // выполнить пачку команд; inv — обратные команды (того же размера). Если СУБД не умеет откатывать DDL (MySQL),
+    // при ошибке уже выполненные команды отменяются обратными.
+    public void Batch(List<string> stm, List<string> inv)
+    {
+        if (D.Transactional) { InTx(delegate { foreach (string s in stm) Exec(s, null); }); return; }
+        int done = 0;
+        try { foreach (string s in stm) { Exec(s, null); done++; } }
+        catch
+        {
+            if (inv != null) for (int i = done - 1; i >= 0; i--) { try { Exec(inv[i], null); } catch { } }
+            App.Log("Ошибка: выполненные команды отменены обратными");
+            throw;
+        }
+    }
+}
+// ===== СУБД: диалекты (SQL Server, Firebird, MySQL) =====
+// Нормализованные таблицы, которые читают матрица и список пользователей:
+//   Objects: oid, sch, nm, tp   (tp: V — представление, U — таблица, P — процедура, FN — функция)
+//   Users:   pid, nm, tp, lg, lt, orphan, prot, dis, sidhex
+//   Logins:  nm, tp, dis        (логины сервера без пользователя в БД; только SQL Server)
+//   Perms:   gid, oid, pn, st   (pn: SELECT / EXECUTE; st: G — выдано, D — запрещено)
+abstract class Dialect
+{
+    protected Db db;
+    public void Bind(Db d) { db = d; }
+    public abstract string Title { get; }
+    public virtual bool Transactional { get { return true; } }
+    public abstract string Q(string id);
+    public virtual string UserRef(string user) { return Q(user); }
+    public virtual string Canon(string name) { return name.Trim(); }
+    public abstract DataTable Objects(string[] types);
+    public abstract DataTable Users();
+    public virtual DataTable Logins() { return Tbl("nm", "tp", "dis"); }
+    public abstract DataTable Perms(DataTable objs, DataTable users);
+    public abstract string Grant(string sch, string nm, string tp, string perm, string user);
+    public abstract string Revoke(string sch, string nm, string tp, string perm, string user);
+    public virtual string Deny(string sch, string nm, string tp, string perm, string user) { return null; }
+    public abstract bool UserExists(string name);
+    public abstract bool IsProtected(string name);
+    public abstract void CreateUser(string name, string pwd);
+    public abstract void DropUser(string name);
+    public abstract void ChangePassword(string name, string pwd);
+
+    protected static DataTable Tbl(params string[] cols)
+    {
+        var t = new DataTable();
+        foreach (string c in cols) t.Columns.Add(c, typeof(object));
+        return t;
+    }
+    protected static string S(object v) { return v == null || v is DBNull ? "" : Convert.ToString(v).Trim(); }
+    protected static bool B(object v)
+    {
+        if (v == null || v is DBNull) return false;
+        if (v is bool) return (bool)v;
+        string s = Convert.ToString(v).Trim().ToUpper();
+        return s == "1" || s == "-1" || s == "TRUE" || s == "T" || s == "Y" || s == "YES";
+    }
+    protected static bool Wants(string[] types, string tp) { return Array.IndexOf(types, tp) >= 0; }
+}
+
+class MssqlDialect : Dialect
+{
+    public override string Title { get { return "SQL Server"; } }
+    public override string Q(string id) { return App.Q(id); }
+
+    public override DataTable Objects(string[] types)
+    {
+        var tl = new List<string>(); foreach (string t in types) tl.Add("'" + t + "'");
+        return db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name");
+    }
+    public override DataTable Users()
+    {
+        DataTable t = db.Query(App.UsersSql);
+        foreach (DataRow r in t.Rows)
+        {
+            string lt = r["lt"] as string, lg = r["lg"] as string;
+            if (Convert.ToInt32(r["prot"]) == 0 && lg != null && (lt == "U" || lt == "G") && db.IsSysadmin(lg)) r["prot"] = 1;
+        }
+        return t;
+    }
+    public override DataTable Logins()
+    {
+        DataTable t = db.Query(App.LoginsSql);
+        for (int i = t.Rows.Count - 1; i >= 0; i--)
+        {
+            string tp = t.Rows[i]["tp"] as string;
+            if ((tp == "U" || tp == "G") && db.IsSysadmin((string)t.Rows[i]["nm"])) t.Rows.RemoveAt(i);
+        }
+        return t;
+    }
+    public override DataTable Perms(DataTable objs, DataTable users)
+    {
+        return db.Query("SELECT dp.grantee_principal_id AS gid, dp.major_id AS oid, dp.permission_name AS pn, dp.state AS st FROM sys.database_permissions dp WHERE dp.class=1 AND dp.minor_id=0 AND dp.permission_name IN ('SELECT','EXECUTE','INSERT','UPDATE','DELETE')");
+    }
+    string Obj(string sch, string nm) { return "OBJECT::" + App.Q(sch) + "." + App.Q(nm); }
+    public override string Grant(string sch, string nm, string tp, string perm, string user) { return "GRANT " + perm + " ON " + Obj(sch, nm) + " TO " + App.Q(user); }
+    public override string Revoke(string sch, string nm, string tp, string perm, string user) { return "REVOKE " + perm + " ON " + Obj(sch, nm) + " FROM " + App.Q(user); }
+    public override string Deny(string sch, string nm, string tp, string perm, string user) { return "DENY " + perm + " ON " + Obj(sch, nm) + " TO " + App.Q(user); }
+    public override bool UserExists(string name) { return db.Count("SELECT COUNT(*) FROM sys.database_principals WHERE name=@n AND type IN ('S','U','G')", "@n", name) > 0; }
+    public override bool IsProtected(string name)
+    {
+        string l = name.ToLower();
+        return l == "sa" || l == "dbo" || l == "guest" || l == "public" || db.IsSysadmin(name) || db.IsDbOwner(name);
+    }
+    public override void CreateUser(string name, string pwd) { throw new NotSupportedException(); }
+    public override void DropUser(string name) { db.Exec("DROP USER " + App.Q(name), null); }
+    public override void ChangePassword(string name, string pwd) { db.Exec("ALTER LOGIN " + App.Q(name) + " WITH PASSWORD=" + App.L(pwd), "ALTER LOGIN " + App.Q(name) + " WITH PASSWORD='***'"); }
+}
+
+// Firebird 3+ (через ODBC). Пользователи общие для сервера (SEC$USERS), права — на объекты текущей базы.
+class FirebirdDialect : Dialect
+{
+    public override string Title { get { return "Firebird"; } }
+    public override string Q(string id) { return "\"" + id.Replace("\"", "\"\"") + "\""; }
+    static bool Simple(string s) { return System.Text.RegularExpressions.Regex.IsMatch(s, "^[A-Za-z][A-Za-z0-9_$]*$"); }
+    public override string Canon(string name) { name = name.Trim(); return Simple(name) ? name.ToUpper() : name; }
+    string Ident(string name) { name = Canon(name); return Q(name); }
+
+    public override DataTable Objects(string[] types)
+    {
+        DataTable src = db.Query(@"SELECT TRIM(RDB$RELATION_NAME) AS nm, CASE WHEN RDB$VIEW_BLR IS NULL THEN 'U' ELSE 'V' END AS tp FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0
+UNION ALL SELECT TRIM(RDB$PROCEDURE_NAME), 'P' FROM RDB$PROCEDURES WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL
+UNION ALL SELECT TRIM(RDB$FUNCTION_NAME), 'FN' FROM RDB$FUNCTIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL");
+        var rows = new List<string[]>();
+        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp }); }
+        rows.Sort(delegate(string[] a, string[] b) { return string.Compare(a[0], b[0], StringComparison.OrdinalIgnoreCase); });
+        DataTable t = Tbl("oid", "sch", "nm", "tp"); int id = 0;
+        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1]);
+        return t;
+    }
+    public override DataTable Users()
+    {
+        DataTable src = db.Query("SELECT TRIM(SEC$USER_NAME) AS nm, SEC$ADMIN AS adm, SEC$ACTIVE AS act FROM SEC$USERS ORDER BY 1");
+        DataTable t = Tbl("pid", "nm", "tp", "lg", "lt", "orphan", "prot", "dis", "sidhex"); int id = 0;
+        foreach (DataRow r in src.Rows)
+        {
+            string nm = S(r["nm"]);
+            bool prot = B(r["adm"]) || nm.ToUpper() == "SYSDBA";
+            t.Rows.Add(++id, nm, "S", nm, "S", 0, prot ? 1 : 0, B(r["act"]) ? 0 : 1, null);
+        }
+        return t;
+    }
+    public override DataTable Perms(DataTable objs, DataTable users)
+    {
+        var rel = new Dictionary<string, int>(); var pro = new Dictionary<string, int>(); var fn = new Dictionary<string, int>();
+        foreach (DataRow r in objs.Rows)
+        {
+            string tp = S(r["tp"]), n = S(r["nm"]); int oid = Convert.ToInt32(r["oid"]);
+            if (tp == "V" || tp == "U") rel[n] = oid; else if (tp == "P") pro[n] = oid; else if (tp == "FN") fn[n] = oid;
+        }
+        var uid = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (DataRow r in users.Rows) uid[S(r["nm"])] = Convert.ToInt32(r["pid"]);
+        DataTable p = db.Query("SELECT TRIM(RDB$USER) AS u, TRIM(RDB$RELATION_NAME) AS r, RDB$OBJECT_TYPE AS t, RDB$PRIVILEGE AS p FROM RDB$USER_PRIVILEGES WHERE RDB$USER_TYPE=8 AND RDB$PRIVILEGE IN ('S','X') AND RDB$FIELD_NAME IS NULL");
+        DataTable t = Tbl("gid", "oid", "pn", "st");
+        foreach (DataRow r in p.Rows)
+        {
+            int g, o; string u = S(r["u"]), n = S(r["r"]), priv = S(r["p"]); int ot = Convert.ToInt32(r["t"]);
+            if (!uid.TryGetValue(u, out g)) continue;
+            if (priv == "S" && ot == 0 && rel.TryGetValue(n, out o)) t.Rows.Add(g, o, "SELECT", "G");
+            else if (priv == "X" && ot == 5 && pro.TryGetValue(n, out o)) t.Rows.Add(g, o, "EXECUTE", "G");
+            else if (priv == "X" && ot == 15 && fn.TryGetValue(n, out o)) t.Rows.Add(g, o, "EXECUTE", "G");
+        }
+        return t;
+    }
+    string Target(string nm, string tp, string perm)
+    {
+        if (tp == "P") return "PROCEDURE " + Q(nm);
+        if (tp == "FN") return "FUNCTION " + Q(nm);
+        return Q(nm);
+    }
+    public override string Grant(string sch, string nm, string tp, string perm, string user) { return "GRANT " + perm + " ON " + Target(nm, tp, perm) + " TO " + Ident(user); }
+    public override string Revoke(string sch, string nm, string tp, string perm, string user) { return "REVOKE " + perm + " ON " + Target(nm, tp, perm) + " FROM " + Ident(user); }
+    public override bool UserExists(string name)
+    {
+        return db.Query("SELECT 1 FROM SEC$USERS WHERE SEC$USER_NAME=" + App.S(Canon(name))).Rows.Count > 0;
+    }
+    public override bool IsProtected(string name)
+    {
+        string n = Canon(name);
+        if (n.ToUpper() == "SYSDBA") return true;
+        DataTable t = db.Query("SELECT SEC$ADMIN AS adm FROM SEC$USERS WHERE SEC$USER_NAME=" + App.S(n));
+        return t.Rows.Count > 0 && B(t.Rows[0]["adm"]);
+    }
+    public override void CreateUser(string name, string pwd) { db.Exec("CREATE USER " + Ident(name) + " PASSWORD " + App.S(pwd), "CREATE USER " + Ident(name) + " PASSWORD '***'"); }
+    public override void DropUser(string name) { db.Exec("DROP USER " + Ident(name), null); }
+    public override void ChangePassword(string name, string pwd) { db.Exec("ALTER USER " + Ident(name) + " PASSWORD " + App.S(pwd), "ALTER USER " + Ident(name) + " PASSWORD '***'"); }
+}
+
+// MySQL / MariaDB (через ODBC). Учётные записи — 'имя'@'хост' (в списке «имя@хост»), права — на объекты выбранной базы.
+// DDL в MySQL фиксируется сразу (откат транзакцией невозможен), поэтому при ошибке выполняются обратные команды.
+class MySqlDialect : Dialect
+{
+    public override string Title { get { return "MySQL"; } }
+    public override bool Transactional { get { return false; } }
+    public override string Q(string id) { return "`" + id.Replace("`", "``") + "`"; }
+    static string Lit(string s) { return "'" + s.Replace("\\", "\\\\").Replace("'", "''") + "'"; }
+    static void Split(string name, out string user, out string host)
+    {
+        int i = name.LastIndexOf('@');
+        if (i > 0) { user = name.Substring(0, i); host = name.Substring(i + 1); } else { user = name; host = "%"; }
+        if (host.Length == 0) host = "%";
+    }
+    public override string Canon(string name) { string u, h; Split(name.Trim(), out u, out h); return u + "@" + h; }
+    public override string UserRef(string user) { string u, h; Split(user, out u, out h); return Lit(u) + "@" + Lit(h); }
+
+    public override DataTable Objects(string[] types)
+    {
+        string d = Lit(db.Name);
+        DataTable src = db.Query("SELECT TABLE_NAME AS nm, CASE WHEN TABLE_TYPE='VIEW' THEN 'V' ELSE 'U' END AS tp FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + d + " AND TABLE_TYPE IN ('BASE TABLE','VIEW') " +
+            "UNION ALL SELECT ROUTINE_NAME, CASE WHEN ROUTINE_TYPE='PROCEDURE' THEN 'P' ELSE 'FN' END FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=" + d);
+        var rows = new List<string[]>();
+        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp }); }
+        rows.Sort(delegate(string[] a, string[] b) { return string.Compare(a[0], b[0], StringComparison.OrdinalIgnoreCase); });
+        DataTable t = Tbl("oid", "sch", "nm", "tp"); int id = 0;
+        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1]);
+        return t;
+    }
+    static readonly string[] SysUsers = { "root", "mysql.sys", "mysql.session", "mysql.infoschema", "mariadb.sys", "debian-sys-maint" };
+    public override DataTable Users()
+    {
+        DataTable src = db.Query("SELECT User AS u, Host AS h, Super_priv AS sp, Grant_priv AS gp, account_locked AS al FROM mysql.user WHERE User<>'' ORDER BY User, Host");
+        DataTable t = Tbl("pid", "nm", "tp", "lg", "lt", "orphan", "prot", "dis", "sidhex"); int id = 0;
+        foreach (DataRow r in src.Rows)
+        {
+            string u = S(r["u"]), h = S(r["h"]), nm = u + "@" + h;
+            bool prot = Array.IndexOf(SysUsers, u.ToLower()) >= 0 || B(r["sp"]) || B(r["gp"]);
+            t.Rows.Add(++id, nm, "S", nm, "S", 0, prot ? 1 : 0, B(r["al"]) ? 1 : 0, null);
+        }
+        return t;
+    }
+    public override DataTable Perms(DataTable objs, DataTable users)
+    {
+        var rel = new Dictionary<string, int>(); var pro = new Dictionary<string, int>(); var fn = new Dictionary<string, int>();
+        foreach (DataRow r in objs.Rows)
+        {
+            string tp = S(r["tp"]), n = S(r["nm"]); int oid = Convert.ToInt32(r["oid"]);
+            if (tp == "V" || tp == "U") rel[n] = oid; else if (tp == "P") pro[n] = oid; else if (tp == "FN") fn[n] = oid;
+        }
+        var uid = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (DataRow r in users.Rows) uid[S(r["nm"])] = Convert.ToInt32(r["pid"]);
+        DataTable t = Tbl("gid", "oid", "pn", "st");
+        string d = Lit(db.Name);
+        foreach (DataRow r in db.Query("SELECT User AS u, Host AS h, Table_name AS n, Table_priv AS p FROM mysql.tables_priv WHERE Db=" + d).Rows)
+        {
+            int g, o;
+            if (!uid.TryGetValue(S(r["u"]) + "@" + S(r["h"]), out g)) continue;
+            if (("," + S(r["p"]).ToLower() + ",").Contains(",select,") && rel.TryGetValue(S(r["n"]), out o)) t.Rows.Add(g, o, "SELECT", "G");
+        }
+        foreach (DataRow r in db.Query("SELECT User AS u, Host AS h, Routine_name AS n, Routine_type AS rt, Proc_priv AS p FROM mysql.procs_priv WHERE Db=" + d).Rows)
+        {
+            int g, o;
+            if (!uid.TryGetValue(S(r["u"]) + "@" + S(r["h"]), out g)) continue;
+            if (!("," + S(r["p"]).ToLower() + ",").Contains(",execute,")) continue;
+            var map = S(r["rt"]).ToUpper() == "PROCEDURE" ? pro : fn;
+            if (map.TryGetValue(S(r["n"]), out o)) t.Rows.Add(g, o, "EXECUTE", "G");
+        }
+        return t;
+    }
+    string Target(string nm, string tp)
+    {
+        string o = Q(db.Name) + "." + Q(nm);
+        if (tp == "P") return "PROCEDURE " + o;
+        if (tp == "FN") return "FUNCTION " + o;
+        return o;
+    }
+    public override string Grant(string sch, string nm, string tp, string perm, string user) { return "GRANT " + perm + " ON " + Target(nm, tp) + " TO " + UserRef(user); }
+    public override string Revoke(string sch, string nm, string tp, string perm, string user) { return "REVOKE " + perm + " ON " + Target(nm, tp) + " FROM " + UserRef(user); }
+    public override bool UserExists(string name)
+    {
+        string u, h; Split(name, out u, out h);
+        return db.Query("SELECT 1 FROM mysql.user WHERE User=" + Lit(u) + " AND Host=" + Lit(h)).Rows.Count > 0;
+    }
+    public override bool IsProtected(string name)
+    {
+        string u, h; Split(name, out u, out h);
+        if (Array.IndexOf(SysUsers, u.ToLower()) >= 0) return true;
+        DataTable t = db.Query("SELECT Super_priv AS sp, Grant_priv AS gp FROM mysql.user WHERE User=" + Lit(u) + " AND Host=" + Lit(h));
+        return t.Rows.Count > 0 && (B(t.Rows[0]["sp"]) || B(t.Rows[0]["gp"]));
+    }
+    public override void CreateUser(string name, string pwd) { db.Exec("CREATE USER " + UserRef(name) + " IDENTIFIED BY " + Lit(pwd), "CREATE USER " + UserRef(name) + " IDENTIFIED BY '***'"); }
+    public override void DropUser(string name) { db.Exec("DROP USER " + UserRef(name), null); }
+    public override void ChangePassword(string name, string pwd) { db.Exec("ALTER USER " + UserRef(name) + " IDENTIFIED BY " + Lit(pwd), "ALTER USER " + UserRef(name) + " IDENTIFIED BY '***'"); }
 }
 
 // ===== тема =====
@@ -382,12 +660,13 @@ static class Theme
 class ConnForm : Form
 {
     ComboBox tServer = new ComboBox();
-    TextBox tUser = new TextBox(), tPass = new TextBox();
-    FlatCombo cAuth = new FlatCombo(), cDb = new FlatCombo();
+    TextBox tUser = new TextBox(), tPass = new TextBox(), tFile = new TextBox();
+    FlatCombo cEng = new FlatCombo(), cAuth = new FlatCombo(), cDrv = new FlatCombo(), cDb = new FlatCombo();
     Button bConn = new Button(), bOk = new Button(), bTheme = new Button(), bFind = new Button();
-    Label lMsg = new Label(), lDb;
-    SqlConnection conn;
+    Label lMsg = new Label(), lDb, lEng, lSrv, lAuth, lUser, lPass, lDrv, lFile;
+    System.Data.Common.DbConnection conn;
     public Db Result;
+    Dictionary<string, string> ini;
 
     public ConnForm()
     {
@@ -395,39 +674,45 @@ class ConnForm : Form
         AutoScaleMode = AutoScaleMode.Dpi; Font = new Font("Segoe UI", 10f);
         try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(480, 480); Size = new Size(520, 560);
+        MinimumSize = new Size(480, 560); Size = new Size(540, 700);
 
-        var ini = App.LoadIni();
+        ini = App.LoadIni();
+        cEng.Items.AddRange(new object[] { "SQL Server", "Firebird (ODBC)", "MySQL / MariaDB (ODBC)" });
+        int ei; cEng.SelectedIndex = ini.ContainsKey("engine") && int.TryParse(ini["engine"], out ei) && ei >= 0 && ei <= 2 ? ei : 0;
         tServer.Text = ini.ContainsKey("server") ? ini["server"] : "localhost";
         tServer.DropDownStyle = ComboBoxStyle.DropDown;
         bFind.Text = "Найти"; bFind.Dock = DockStyle.Right; bFind.Width = 90;
         foreach (string s in LocalInstances()) AddServer(s);
         if (ini.ContainsKey("servers"))
             foreach (string s in ini["servers"].Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries)) AddServer(s);
-        cAuth.DropDownStyle = ComboBoxStyle.DropDownList;
         cAuth.Items.AddRange(new object[] { "Windows-аутентификация", "SQL Server (sa и т.п.)" });
         cAuth.SelectedIndex = (ini.ContainsKey("auth") && ini["auth"] == "1") ? 1 : 0;
         tUser.Text = ini.ContainsKey("user") ? ini["user"] : "sa";
         tPass.UseSystemPasswordChar = true;
-        cDb.DropDownStyle = ComboBoxStyle.DropDownList;
+        tFile.Text = ini.ContainsKey("fbfile") ? ini["fbfile"] : "";
         bConn.Text = "Подключиться"; bConn.Tag = "primary"; bConn.AutoSize = true; bConn.MinimumSize = new Size(170, 36);
         bOk.Text = "Выбрать базу"; bOk.AutoSize = true; bOk.MinimumSize = new Size(170, 36); bOk.Enabled = false;
-        lMsg.AutoSize = true; lMsg.MaximumSize = new Size(420, 0); lMsg.Margin = new Padding(3, 8, 3, 8);
+        lMsg.AutoSize = true; lMsg.MaximumSize = new Size(440, 0); lMsg.Margin = new Padding(3, 8, 3, 8);
         bTheme.Text = Theme.Label; bTheme.AutoSize = true; bTheme.Anchor = AnchorStyles.Top | AnchorStyles.Right;
 
         var title = new Label { Text = "LoginChanger", AutoSize = true, Font = new Font("Segoe UI Semibold", 20f), Margin = new Padding(3, 0, 3, 0) };
-        var sub = new Label { Text = "Быстрые пользователи и права для MSSQL", AutoSize = true, Tag = "muted", Margin = new Padding(3, 0, 3, 20) };
+        var sub = new Label { Text = "Быстрые пользователи и права для баз данных", AutoSize = true, Tag = "muted", Margin = new Padding(3, 0, 3, 16) };
 
-        var tl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(28, 44, 28, 20) };
+        var tl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(28, 44, 28, 20), AutoScroll = true };
         tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         tl.RowCount = 2;
         tl.Controls.Add(title, 0, 0); tl.SetColumnSpan(title, 2);
         tl.Controls.Add(sub, 0, 1); tl.SetColumnSpan(sub, 2);
+        lEng = AddRow(tl, "СУБД:", cEng);
         var pS = new Panel { Height = 32, MinimumSize = new Size(0, 32) };
         tServer.Dock = DockStyle.Fill; pS.Controls.Add(tServer); pS.Controls.Add(bFind);
-        AddRow(tl, "Сервер:", pS); AddRow(tl, "Вход:", cAuth);
-        AddRow(tl, "Логин:", tUser); AddRow(tl, "Пароль:", tPass);
+        lSrv = AddRow(tl, "Сервер:", pS);
+        lAuth = AddRow(tl, "Вход:", cAuth);
+        lDrv = AddRow(tl, "Драйвер ODBC:", cDrv);
+        lFile = AddRow(tl, "Файл базы:", tFile);
+        lUser = AddRow(tl, "Логин:", tUser);
+        lPass = AddRow(tl, "Пароль:", tPass);
         int r = tl.RowCount++; tl.Controls.Add(bConn, 1, r);
         r = tl.RowCount++; tl.Controls.Add(lMsg, 0, r); tl.SetColumnSpan(lMsg, 2);
         lDb = AddRow(tl, "База данных:", cDb);
@@ -436,13 +721,15 @@ class ConnForm : Form
         Controls.Add(tl); Controls.Add(bTheme); bTheme.BringToFront();
         Load += delegate { bTheme.Location = new Point(ClientSize.Width - bTheme.Width - 16, 14); };
 
+        cEng.SelectedIndexChanged += delegate { ApplyEngine(true); };
         cAuth.SelectedIndexChanged += delegate { tUser.Enabled = tPass.Enabled = cAuth.SelectedIndex == 1; Reset(null, null); };
-        tUser.Enabled = tPass.Enabled = cAuth.SelectedIndex == 1;
-        tServer.TextChanged += Reset; tUser.TextChanged += Reset; tPass.TextChanged += Reset;
+        cDrv.SelectedIndexChanged += Reset;
+        tServer.TextChanged += Reset; tUser.TextChanged += Reset; tPass.TextChanged += Reset; tFile.TextChanged += Reset;
         bConn.Click += Connect; bOk.Click += OpenDb; bFind.Click += Find;
         bTheme.Click += delegate { Theme.Toggle(); Theme.Apply(this); bTheme.Text = Theme.Label; Msg(lMsg.Text, lMsg.Tag as string == "err"); };
         AcceptButton = bConn;
         FormClosed += delegate { if (Result == null && conn != null) conn.Dispose(); };
+        ApplyEngine(false);
         Theme.Apply(this);
     }
 
@@ -453,6 +740,49 @@ class ConnForm : Form
         tl.Controls.Add(l, 0, r);
         c.Dock = DockStyle.Fill; c.Margin = new Padding(3, 5, 3, 5); tl.Controls.Add(c, 1, r);
         return l;
+    }
+
+    int Eng { get { return cEng.SelectedIndex; } }   // 0 — SQL Server, 1 — Firebird, 2 — MySQL
+
+    static List<string> OdbcDrivers(string pattern)
+    {
+        var l = new List<string>();
+        try
+        {
+            using (var k = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\ODBC\ODBCINST.INI\ODBC Drivers"))
+                if (k != null)
+                    foreach (string n in k.GetValueNames())
+                        if (System.Text.RegularExpressions.Regex.IsMatch(n, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase)) l.Add(n);
+        }
+        catch { }
+        l.Sort(delegate(string a, string b) { return (a.Contains("ANSI") ? 1 : 0) - (b.Contains("ANSI") ? 1 : 0); });
+        return l;
+    }
+
+    void ApplyEngine(bool userChange)
+    {
+        bool ms = Eng == 0, fb = Eng == 1;
+        lAuth.Visible = cAuth.Visible = ms;
+        lDrv.Visible = cDrv.Visible = !ms;
+        lFile.Visible = tFile.Visible = fb;
+        bFind.Visible = ms;
+        if (!ms)
+        {
+            string sel = cDrv.SelectedItem as string;
+            cDrv.Items.Clear();
+            foreach (string d in OdbcDrivers(fb ? "Firebird|InterBase" : "MySQL|MariaDB")) cDrv.Items.Add(d);
+            if (cDrv.Items.Count > 0) cDrv.SelectedIndex = sel != null && cDrv.Items.Contains(sel) ? cDrv.Items.IndexOf(sel) : 0;
+        }
+        tUser.Enabled = tPass.Enabled = ms ? cAuth.SelectedIndex == 1 : true;
+        if (userChange)
+        {
+            string u = tUser.Text.Trim().ToLower();
+            if (u == "sa" || u == "root" || u == "sysdba" || u.Length == 0) tUser.Text = ms ? "sa" : fb ? "SYSDBA" : "root";
+        }
+        bOk.Text = fb ? "Открыть базу" : "Выбрать базу";
+        Reset(null, null);
+        if (!ms && cDrv.Items.Count == 0)
+            Msg("ODBC-драйвер не найден. Установите драйвер " + (fb ? "Firebird ODBC" : "MySQL Connector/ODBC") + " (разрядность как у программы).", true);
     }
 
     void AddServer(string s)
@@ -523,7 +853,7 @@ class ConnForm : Form
     void FindDone(int my, List<string> found, bool timeout)
     {
         foreach (string x in found) AddServer(x);
-        if (my != findToken || !searching) return;     // уже завершено по тайм-ауту или более новым поиском
+        if (my != findToken || !searching) return;
         searching = false; bFind.Enabled = true; bFind.Text = "Найти";
         int n = tServer.Items.Count;
         if (found.Count > 0) Msg("Найдено серверов в сети: " + found.Count + ". Выберите из списка.", false);
@@ -531,6 +861,7 @@ class ConnForm : Form
         else Msg("В сети серверов не найдено (на них должна работать служба SQL Server Browser). Локальные: " + n + ".", false);
         if (n > 0) tServer.DroppedDown = true;
     }
+
     void Msg(string t, bool err)
     {
         lMsg.Text = t; lMsg.Tag = err ? "err" : null; lMsg.ForeColor = err ? Theme.Err : Theme.Fg;
@@ -538,11 +869,41 @@ class ConnForm : Form
 
     void Reset(object s, EventArgs e)
     {
-        if (!lDb.Visible) return;
+        if (!bOk.Visible) return;
         lDb.Visible = cDb.Visible = bOk.Visible = false; bOk.Enabled = false;
         if (conn != null) { conn.Dispose(); conn = null; }
         bConn.Text = "Подключиться"; bConn.Tag = "primary"; Theme.StyleButton(bConn);
         AcceptButton = bConn; Msg("", false);
+    }
+
+    // хост[:порт] -> (хост, порт)
+    static void HostPort(string s, out string host, out string port)
+    {
+        s = s.Trim(); host = s; port = "";
+        int i = s.LastIndexOf(':');
+        if (i > 0 && s.IndexOf(':') == i) { host = s.Substring(0, i); port = s.Substring(i + 1); }
+        if (host.Length == 0) host = "localhost";
+    }
+
+    string OdbcString()
+    {
+        string drv = cDrv.SelectedItem as string;
+        if (drv == null) throw new Exception("Не выбран ODBC-драйвер.");
+        string host, port; HostPort(tServer.Text, out host, out port);
+        string u = tUser.Text.Trim(), p = tPass.Text;
+        if (Eng == 1)
+        {
+            string file = tFile.Text.Trim();
+            if (file.Length == 0) throw new Exception("Укажите путь к файлу базы (.fdb) на сервере.");
+            string dsn = host + (port.Length > 0 ? "/" + port : "") + ":" + file;
+            return "DRIVER={" + drv + "};DBNAME=" + dsn + ";UID=" + u + ";PWD=" + p + ";CHARSET=UTF8;";
+        }
+        return "DRIVER={" + drv + "};SERVER=" + host + ";PORT=" + (port.Length > 0 ? port : "3306") + ";UID=" + u + ";PWD=" + p + ";";
+    }
+
+    static string Scalar(System.Data.Common.DbConnection c, string sql)
+    {
+        using (var cmd = c.CreateCommand()) { cmd.CommandText = sql; object o = cmd.ExecuteScalar(); return o == null || o is DBNull ? "" : Convert.ToString(o); }
     }
 
     void Connect(object s, EventArgs e)
@@ -551,28 +912,52 @@ class ConnForm : Form
         {
             Cursor = Cursors.WaitCursor; Msg("", false);
             if (conn != null) conn.Dispose();
-            var sb = new SqlConnectionStringBuilder();
-            sb.DataSource = tServer.Text.Trim(); sb.InitialCatalog = "master";
-            sb.TrustServerCertificate = true; sb.ConnectTimeout = 10; sb.ApplicationName = "LoginChanger";
-            if (cAuth.SelectedIndex == 0) sb.IntegratedSecurity = true;
-            else { sb.UserID = tUser.Text.Trim(); sb.Password = tPass.Text; }
-            conn = new SqlConnection(sb.ConnectionString);
-            conn.Open();
             cDb.Items.Clear();
-            using (var c = new SqlCommand("SELECT name FROM sys.databases WHERE state=0 AND HAS_DBACCESS(name)=1 AND name NOT IN ('master','tempdb','model','msdb') ORDER BY name", conn))
-            using (var rd = c.ExecuteReader()) while (rd.Read()) cDb.Items.Add(rd.GetString(0));
-            var ini = App.LoadIni();
-            if (ini.ContainsKey("db") && cDb.Items.Contains(ini["db"])) cDb.SelectedItem = ini["db"];
+            bool sa = true;
+            if (Eng == 0)
+            {
+                var sb = new SqlConnectionStringBuilder();
+                sb.DataSource = tServer.Text.Trim(); sb.InitialCatalog = "master";
+                sb.TrustServerCertificate = true; sb.ConnectTimeout = 10; sb.ApplicationName = "LoginChanger";
+                if (cAuth.SelectedIndex == 0) sb.IntegratedSecurity = true;
+                else { sb.UserID = tUser.Text.Trim(); sb.Password = tPass.Text; }
+                conn = new SqlConnection(sb.ConnectionString);
+                conn.Open();
+                using (var c = conn.CreateCommand())
+                {
+                    c.CommandText = "SELECT name FROM sys.databases WHERE state=0 AND HAS_DBACCESS(name)=1 AND name NOT IN ('master','tempdb','model','msdb') ORDER BY name";
+                    using (var rd = c.ExecuteReader()) while (rd.Read()) cDb.Items.Add(rd.GetString(0));
+                }
+                sa = Scalar(conn, "SELECT IS_SRVROLEMEMBER('sysadmin')") == "1";
+            }
+            else
+            {
+                var oc = new System.Data.Odbc.OdbcConnection(OdbcString());
+                conn = oc; oc.ConnectionTimeout = 10; oc.Open();
+                if (Eng == 2)
+                {
+                    using (var c = conn.CreateCommand())
+                    {
+                        c.CommandText = "SHOW DATABASES";
+                        using (var rd = c.ExecuteReader())
+                            while (rd.Read())
+                            {
+                                string n = Convert.ToString(rd.GetValue(0));
+                                if (n != "information_schema" && n != "mysql" && n != "performance_schema" && n != "sys") cDb.Items.Add(n);
+                            }
+                    }
+                }
+            }
+            var ini2 = App.LoadIni();
+            if (ini2.ContainsKey("db") && cDb.Items.Contains(ini2["db"])) cDb.SelectedItem = ini2["db"];
             else if (cDb.Items.Count > 0) cDb.SelectedIndex = 0;
-            bool sa;
-            using (var c = new SqlCommand("SELECT IS_SRVROLEMEMBER('sysadmin')", conn)) sa = Convert.ToInt32(c.ExecuteScalar()) == 1;
-            App.Log("Подключено к " + sb.DataSource);
-            if (cDb.Items.Count == 0) { Msg("Подключено, но доступных баз нет.", true); return; }
-            Msg(sa ? "Подключение успешно. Выберите базу." : "Подключено, но НЕ sysadmin: часть действий может не работать.", !sa);
-            lDb.Visible = cDb.Visible = bOk.Visible = true; bOk.Enabled = true;
+            App.Log("Подключено к " + tServer.Text.Trim() + " (" + cEng.SelectedItem + ")");
+            if (Eng != 1 && cDb.Items.Count == 0) { Msg("Подключено, но доступных баз нет.", true); return; }
+            Msg(Eng == 1 ? "Подключение успешно. Откройте базу." : sa ? "Подключение успешно. Выберите базу." : "Подключено, но НЕ sysadmin: часть действий может не работать.", !sa);
+            lDb.Visible = cDb.Visible = Eng != 1; bOk.Visible = true; bOk.Enabled = true;
             bConn.Text = "Переподключиться"; bConn.Tag = null; Theme.StyleButton(bConn);
             bOk.Tag = "primary"; Theme.StyleButton(bOk);
-            AcceptButton = bOk; cDb.Focus();
+            AcceptButton = bOk; if (Eng != 1) cDb.Focus();
         }
         catch (Exception ex)
         {
@@ -586,16 +971,35 @@ class ConnForm : Form
     {
         try
         {
-            string db = (string)cDb.SelectedItem;
-            conn.ChangeDatabase(db);
-            var d = new Db { C = conn, Server = tServer.Text.Trim(), Name = db };
-            using (var c = new SqlCommand("SELECT SUSER_SNAME()", conn)) d.Who = Convert.ToString(c.ExecuteScalar());
-            var ini = App.LoadIni();
+            var d = new Db { C = conn, Server = tServer.Text.Trim() };
+            if (Eng == 0)
+            {
+                d.Kind = "mssql"; d.D = new MssqlDialect(); d.Name = (string)cDb.SelectedItem;
+                conn.ChangeDatabase(d.Name);
+                d.Who = Scalar(conn, "SELECT SUSER_SNAME()");
+            }
+            else if (Eng == 1)
+            {
+                d.Kind = "firebird"; d.D = new FirebirdDialect();
+                string f = tFile.Text.Trim(); int i = Math.Max(f.LastIndexOf('\\'), f.LastIndexOf('/'));
+                d.Name = i >= 0 ? f.Substring(i + 1) : f;
+                d.Who = Scalar(conn, "SELECT CURRENT_USER FROM RDB$DATABASE").Trim();
+            }
+            else
+            {
+                d.Kind = "mysql"; d.D = new MySqlDialect(); d.Name = (string)cDb.SelectedItem;
+                using (var c = conn.CreateCommand()) { c.CommandText = "USE " + d.D.Q(d.Name); c.ExecuteNonQuery(); }
+                d.Who = Scalar(conn, "SELECT CURRENT_USER()");
+            }
+            d.D.Bind(d);
+            ini = App.LoadIni();
+            ini["engine"] = Eng.ToString(); ini["server"] = d.Server; ini["auth"] = cAuth.SelectedIndex.ToString(); ini["user"] = tUser.Text.Trim();
+            if (Eng == 0 || Eng == 2) ini["db"] = d.Name;
+            if (Eng == 1) ini["fbfile"] = tFile.Text.Trim();
             var sv = new List<string>(); foreach (object o in tServer.Items) sv.Add((string)o);
             ini["servers"] = string.Join(";", sv.ToArray());
-            ini["server"] = d.Server; ini["auth"] = cAuth.SelectedIndex.ToString(); ini["user"] = tUser.Text.Trim(); ini["db"] = db;
             App.SaveIni(ini);
-            App.Log("Открыта БД " + db + " как " + d.Who);
+            App.Log("Открыта БД " + d.Name + " (" + d.D.Title + ") как " + d.Who);
             Result = d; DialogResult = DialogResult.OK;
         }
         catch (Exception ex) { Msg(ex.Message, true); }
@@ -646,6 +1050,7 @@ class CreateForm : Form
     public PwdBox Pwd = new PwdBox();
     public ComboBox Tpl = new ComboBox();
     public CheckBox PolicyOff = new CheckBox();
+    public Label HintL;
 
     public CreateForm(string preset, List<string> tplItems)
     {
@@ -666,7 +1071,7 @@ class CreateForm : Form
         Row(tl, "Пароль:", Pwd);
         Row(tl, "Права по шаблону:", Tpl);
         tl.Controls.Add(PolicyOff, 1, 3);
-        var hint = new Label { Text = "Имя вида DOMAIN\\user — логин Windows (пароль не нужен). Если логин уже есть на сервере — пароль не меняется.", AutoSize = true, MaximumSize = new Size(480, 0), Tag = "muted" };
+        var hint = HintL = new Label { Text = "Имя вида DOMAIN\\user — логин Windows (пароль не нужен). Если логин уже есть на сервере — пароль не меняется.", AutoSize = true, MaximumSize = new Size(480, 0), Tag = "muted" };
         tl.Controls.Add(hint, 1, 4);
         var ok = new Button { Text = "Создать", DialogResult = DialogResult.OK, AutoSize = true };
         var cn = new Button { Text = "Отмена", DialogResult = DialogResult.Cancel, AutoSize = true };
@@ -1097,8 +1502,8 @@ class UsersTab : Panel
         var left = FlowRow(); left.Dock = DockStyle.Fill; var right = FlowRow(); right.WrapContents = false; right.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         AddBtn(left, "Создать пользователя", delegate { Create(null); }, "primary");
         AddBtn(left, "Массовое создание", delegate { BulkCreate(); }, "ghost");
-        AddBtn(left, "Добавить логин в БД", delegate { var it = Sel(); if (it == null || it.Kind != "login") { UI.Warn("Выберите строку «Логин есть, в БД нет»."); return; } Create(it.Name); }, "ghost");
-        AddBtn(left, "Починить сироту", delegate { FixOrphan(); }, "ghost");
+        bAddLogin = AddBtn(left, "Добавить логин в БД", delegate { var it = Sel(); if (it == null || it.Kind != "login") { UI.Warn("Выберите строку «Логин есть, в БД нет»."); return; } Create(it.Name); }, "ghost");
+        bOrph = AddBtn(left, "Починить сироту", delegate { FixOrphan(); }, "ghost");
         AddBtn(left, "Сменить пароль", delegate { ChangePwd(); }, "ghost");
         AddBtn(left, "Права как у…", delegate { CopyFrom(); }, "ghost");
         AddBtn(left, "Сохранить как шаблон", delegate { SaveTpl(); }, "ghost");
@@ -1107,11 +1512,13 @@ class UsersTab : Panel
         pick.Margin = new Padding(0, 3, 8, 3); pick.Changed += Filter; right.Controls.Add(pick);
         AddBtn(right, "Экспорт CSV", delegate { Csv.Export(g, "users"); }, "ghost");
         AddBtn(right, "Обновить", delegate { Reload(); }, "ghost").Margin = new Padding(0, 3, 0, 3);
-        bar.Controls.Add(left, 0, 0); bar.Controls.Add(right, 1, 0);        var legend = new Label { Text = "Администраторы (sysadmin, db_owner), sa и dbo скрыты и не меняются.  Оранжевые — логины сервера без доступа к этой БД.", AutoSize = true, Tag = "muted", Dock = DockStyle.Top, Margin = new Padding(0), Padding = new Padding(0, 0, 0, 8) };
+        if (db.Kind != "mssql") { bAddLogin.Visible = false; bOrph.Visible = false; }
+        bar.Controls.Add(left, 0, 0); bar.Controls.Add(right, 1, 0);        var legend = new Label { Text = db.Kind == "mssql" ? "Администраторы (sysadmin, db_owner), sa и dbo скрыты и не меняются.  Оранжевые — логины сервера без доступа к этой БД." : "Администраторы скрыты и не меняются. Пользователи общие для всего сервера; права показаны для " + (db.Kind == "mysql" ? "базы" : "базы") + " «" + db.Name + "».", AutoSize = true, Tag = "muted", Dock = DockStyle.Top, Margin = new Padding(0), Padding = new Padding(0, 0, 0, 8) };
         Controls.Add(g); Controls.Add(legend); Controls.Add(bar);
     }
 
     HintBox tfind = new HintBox();
+    Button bAddLogin, bOrph;
     CheckPicker pick = new CheckPicker("Список");
     void Filter()
     {
@@ -1153,7 +1560,7 @@ class UsersTab : Panel
                 };
                 string st = it.Prot ? "Защищён (admin/sa) — не трогаем" : it.Orphan ? "Сирота: логина на сервере нет" : "OK";
                 if (!it.Prot && !it.Orphan && Convert.ToInt32(r["dis"]) == 1) st = "OK (логин отключён)";
-                AddRow(it, st, it.Login, TypeName(r["tp"] as string));
+                AddRow(it, st, it.Login, db.Kind == "mssql" ? TypeName(r["tp"] as string) : db.D.Title);
             }
             foreach (DataRow r in db.Logins().Rows)
             {
@@ -1187,6 +1594,11 @@ class UsersTab : Panel
     {
         using (var f = new CreateForm(preset, TemplateItems()))
         {
+            if (db.Kind != "mssql")
+            {
+                f.PolicyOff.Visible = false;
+                f.HintL.Text = db.Kind == "mysql" ? "Имя или имя@хост (по умолчанию хост «%» — откуда угодно). Если пользователь уже есть, пароль не меняется." : "Имя пользователя Firebird (хранится в верхнем регистре). Если пользователь уже есть, пароль не меняется.";
+            }
             if (f.ShowDialog(this) != DialogResult.OK) return;
             string tpl = f.Tpl.SelectedIndex > 0 ? (string)f.Tpl.SelectedItem : null;
             try { DoCreate(f.TName.Text.Trim(), f.Pwd.T.Text, f.PolicyOff.Checked, tpl, false); }
@@ -1206,6 +1618,7 @@ class UsersTab : Panel
     // quiet = без вопросов и окон (массовое создание): безопасные варианты выбираются автоматически
     CreateResult DoCreate(string name, string pwd, bool policyOff, string tpl, bool quiet)
     {
+        if (db.Kind != "mssql") return CreateOther(name, pwd, tpl, quiet);
         if (name.Length == 0) return Fin(quiet, false, "Укажите имя.", false);
         string low = name.ToLower();
         if (low == "sa" || low == "dbo" || low == "guest" || low == "public") return Fin(quiet, false, "Это имя защищено, не трогаем.", false);
@@ -1250,6 +1663,57 @@ class UsersTab : Panel
         if (tpl != null) ApplyTpl(name, tpl);
         App.Log("Готово: " + name + " — " + what);
         return Fin(quiet, true, quiet ? what : "Готово: " + name, newLogin);
+    }
+
+    // Firebird / MySQL: пользователь сервера + права на объекты текущей базы
+    CreateResult CreateOther(string name, string pwd, string tpl, bool quiet)
+    {
+        name = db.D.Canon(name);
+        if (name.Length == 0 || name == "@%") return Fin(quiet, false, "Укажите имя.", false);
+        if (db.D.IsProtected(name)) return Fin(quiet, false, "Это имя защищено (администратор), не трогаем.", false);
+        bool newUser = false; string what;
+        if (!db.D.UserExists(name))
+        {
+            if (pwd.Length == 0) return Fin(quiet, false, "Нужен пароль.", false);
+            db.D.CreateUser(name, pwd); newUser = true; what = "создан пользователь";
+        }
+        else
+        {
+            if (tpl == null) return Fin(quiet, true, "Пользователь уже существует.", false);
+            what = "уже существовал, права добавлены";
+        }
+        if (tpl != null) ApplyTpl(name, tpl);
+        App.Log("Готово: " + name + " — " + what);
+        return Fin(quiet, true, quiet ? what : "Готово: " + name, newUser);
+    }
+
+    List<string> UserTplOther(string user)
+    {
+        var l = new List<string>();
+        DataTable ot = db.D.Objects(new[] { "V", "U", "P", "FN" }), ut = db.Users(), pt = db.D.Perms(ot, ut);
+        int pid = -1; foreach (DataRow r in ut.Rows) if (string.Equals((string)r["nm"], user, StringComparison.OrdinalIgnoreCase)) pid = Convert.ToInt32(r["pid"]);
+        var names = new Dictionary<int, string[]>(); foreach (DataRow r in ot.Rows) names[Convert.ToInt32(r["oid"])] = new[] { Convert.ToString(r["sch"]), Convert.ToString(r["nm"]) };
+        foreach (DataRow r in pt.Rows)
+            if (Convert.ToInt32(r["gid"]) == pid) { string[] n = names[Convert.ToInt32(r["oid"])]; l.Add("P|" + n[0] + "|" + n[1] + "|" + Convert.ToString(r["pn"])); }
+        return l;
+    }
+
+    void ApplyTplOther(string user, List<string> lines)
+    {
+        var okPerm = new List<string>(new[] { "SELECT", "EXECUTE" });
+        DataTable ot = db.D.Objects(new[] { "V", "U", "P", "FN" });
+        var byName = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (DataRow r in ot.Rows) byName[Convert.ToString(r["nm"])] = new[] { Convert.ToString(r["sch"]), Convert.ToString(r["tp"]) };
+        var stm = new List<string>(); var inv = new List<string>();
+        foreach (string ln in lines)
+        {
+            string[] p = ln.Split('|');
+            if (p[0] != "P" || p.Length != 4 || !okPerm.Contains(p[3])) continue;
+            string[] o;
+            if (!byName.TryGetValue(p[2], out o)) { App.Log("Пропуск (нет объекта): " + p[2]); continue; }
+            stm.Add(db.D.Grant(o[0], p[2], o[1], p[3], user)); inv.Add(db.D.Revoke(o[0], p[2], o[1], p[3], user));
+        }
+        db.Batch(stm, inv);
     }
 
     List<string> TemplateItems()
@@ -1305,6 +1769,7 @@ class UsersTab : Panel
     // --- шаблоны ---
     List<string> UserTpl(string user)
     {
+        if (db.Kind != "mssql") return UserTplOther(user);
         var l = new List<string>();
         foreach (DataRow r in db.Query(@"SELECT s.name AS sch, o.name AS nm, dp.permission_name AS pn FROM sys.database_permissions dp
 JOIN sys.objects o ON o.object_id=dp.major_id JOIN sys.schemas s ON s.schema_id=o.schema_id
@@ -1322,6 +1787,7 @@ WHERE m.member_principal_id=USER_ID(@u) AND r.name NOT IN ('db_owner','db_access
         List<string> lines = kind == "Шаблон"
             ? new List<string>(File.ReadAllLines(Path.Combine(Path.Combine(App.Dir, "templates"), nm + ".tpl"), Encoding.UTF8))
             : UserTpl(nm);
+        if (db.Kind != "mssql") { ApplyTplOther(user, lines); return; }
         var okPerm = new List<string>(new[] { "SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE" });
         var badRole = new List<string>(new[] { "db_owner", "db_accessadmin", "db_securityadmin", "public" });
         db.InTx(delegate
@@ -1441,7 +1907,8 @@ WHERE m.member_principal_id=USER_ID(@u) AND r.name NOT IN ('db_owner','db_access
             if (d.ShowDialog(this) != DialogResult.OK || d.Pwd.Length == 0) return;
             try
             {
-                db.Exec("ALTER LOGIN " + App.Q(it.Login) + " WITH PASSWORD=" + App.L(d.Pwd), "ALTER LOGIN " + App.Q(it.Login) + " WITH PASSWORD='***'");
+                if (db.Kind != "mssql") db.D.ChangePassword(it.Name, d.Pwd);
+                else db.Exec("ALTER LOGIN " + App.Q(it.Login) + " WITH PASSWORD=" + App.L(d.Pwd), "ALTER LOGIN " + App.Q(it.Login) + " WITH PASSWORD='***'");
                 UI.Info("Пароль изменён.");
             }
             catch (Exception ex) { App.Log("ОШИБКА: " + ex.Message); UI.Warn(ex.Message); }
@@ -1469,6 +1936,7 @@ class Matrix : Panel
     public bool Stale = true;
     public event Action Changed;
 
+    static string Full(Obj o) { return o.Sch.Length > 0 ? o.Sch + "." + o.Nm : o.Nm; }
     static Color Pending { get { return Theme.Pending; } }
     static Color Denied { get { return Theme.Denied; } }
     const int FixedCols = 3;
@@ -1564,20 +2032,21 @@ class Matrix : Panel
         try
         {
             Cursor = Cursors.WaitCursor; loading = true;
-            var tl = new List<string>(); foreach (string t in types) tl.Add("'" + t + "'");
             objs.Clear(); usrs.Clear(); perm.Clear();
-            foreach (DataRow r in db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name").Rows)
-                objs.Add(new Obj { Oid = Convert.ToInt32(r["oid"]), Sch = (string)r["sch"], Nm = (string)r["nm"], Tp = (string)r["tp"] });
-            foreach (DataRow r in db.Users().Rows)
+            DataTable ot = db.D.Objects(types);
+            foreach (DataRow r in ot.Rows)
+                objs.Add(new Obj { Oid = Convert.ToInt32(r["oid"]), Sch = Convert.ToString(r["sch"]), Nm = Convert.ToString(r["nm"]), Tp = Convert.ToString(r["tp"]) });
+            DataTable ut = db.Users();
+            foreach (DataRow r in ut.Rows)
                 if (Convert.ToInt32(r["prot"]) == 0)
                     usrs.Add(new Usr { Pid = Convert.ToInt32(r["pid"]), Name = (string)r["nm"], Head = (string)r["nm"] + (Convert.ToInt32(r["orphan"]) == 1 ? " ⚠" : "") });
             int outN = 0;
             foreach (DataRow r in db.Logins().Rows)
                 usrs.Add(new Usr { Pid = --outN, Name = (string)r["nm"], Head = (string)r["nm"] + "\n(нет в БД)", Out = true });
-            foreach (DataRow r in db.Query("SELECT dp.grantee_principal_id AS gid, dp.major_id AS oid, dp.permission_name AS pn, dp.state AS st FROM sys.database_permissions dp WHERE dp.class=1 AND dp.minor_id=0 AND dp.permission_name IN ('SELECT','EXECUTE','INSERT','UPDATE','DELETE')").Rows)
-                perm[Key(Convert.ToInt32(r["gid"]), Convert.ToInt32(r["oid"]), (string)r["pn"])] = Convert.ToString(r["st"])[0];
+            foreach (DataRow r in db.D.Perms(ot, ut).Rows)
+                perm[Key(Convert.ToInt32(r["gid"]), Convert.ToInt32(r["oid"]), Convert.ToString(r["pn"]))] = Convert.ToString(r["st"])[0];
 
-            var on = new List<string>(); foreach (Obj o in objs) on.Add(o.Sch + "." + o.Nm); objPick.SetItems(on);
+            var on = new List<string>(); foreach (Obj o in objs) on.Add(Full(o)); objPick.SetItems(on);
             var un = new List<string>(); foreach (Usr u in usrs) un.Add(u.Name); userPick.SetItems(un);
             g.Columns.Clear();
             AddCol("Объект", 300, true); AddCol("Все", 64, true); AddCol("Право", 70, true);
@@ -1591,8 +2060,9 @@ class Matrix : Panel
             g.Columns[0].Frozen = true;
             string prevS = cs.SelectedIndex > 0 ? (string)cs.SelectedItem : null;
             cs.Items.Clear(); cs.Items.Add("Все схемы");
-            foreach (Obj o in objs) if (!cs.Items.Contains(o.Sch)) cs.Items.Add(o.Sch);
+            foreach (Obj o in objs) if (o.Sch.Length > 0 && !cs.Items.Contains(o.Sch)) cs.Items.Add(o.Sch);
             cs.SelectedIndex = prevS != null && cs.Items.Contains(prevS) ? cs.Items.IndexOf(prevS) : 0;
+            cs.Visible = cs.Items.Count > 1;
             Fill(); FilterCols();
             Stale = false;
         }
@@ -1617,7 +2087,7 @@ class Matrix : Panel
             var vals = new object[FixedCols + usrs.Count];
             foreach (Obj o in objs)
             {
-                vals[0] = o.Sch + "." + o.Nm; vals[1] = o.Tp; vals[2] = o.Perm;
+                vals[0] = Full(o); vals[1] = o.Tp; vals[2] = o.Perm;
                 for (int i = 0; i < usrs.Count; i++)
                 {
                     char st; perm.TryGetValue(Key(usrs[i].Pid, o.Oid, o.Perm), out st);
@@ -1647,9 +2117,9 @@ class Matrix : Panel
         foreach (DataGridViewRow r in g.Rows)
         {
             var o = (Obj)r.Tag;
-            string n = (o.Sch + "." + o.Nm).ToLower();
+            string n = Full(o).ToLower();
             bool ok = sch == null || o.Sch == sch;
-            if (ok && objPick.Checked.Count > 0 && !objPick.Checked.Contains(o.Sch + "." + o.Nm)) ok = false;
+            if (ok && objPick.Checked.Count > 0 && !objPick.Checked.Contains(Full(o))) ok = false;
             foreach (string w in inc) if (ok && !n.Contains(w)) ok = false;
             foreach (string w in exc) if (ok && n.Contains(w)) ok = false;
             if (ok && mode > 0)
@@ -1897,18 +2367,18 @@ class Matrix : Panel
                 string k = Key(pid, o.Oid, o.Perm);
                 if (!pend.Contains(k)) continue;
                 bool v = (bool)r.Cells[c].Value;
-                string user = App.Q(usrs[c - FixedCols].Name);
-                string obj = "OBJECT::" + App.Q(o.Sch) + "." + App.Q(o.Nm);
+                string user = usrs[c - FixedCols].Name;
                 char st; perm.TryGetValue(k, out st);
                 if (v)
                 {
-                    stm.Add("GRANT " + o.Perm + " ON " + obj + " TO " + user);
-                    inv.Add(st == (char)68 ? "DENY " + o.Perm + " ON " + obj + " TO " + user : "REVOKE " + o.Perm + " ON " + obj + " FROM " + user);
+                    stm.Add(db.D.Grant(o.Sch, o.Nm, o.Tp, o.Perm, user));
+                    string dn = st == (char)68 ? db.D.Deny(o.Sch, o.Nm, o.Tp, o.Perm, user) : null;
+                    inv.Add(dn ?? db.D.Revoke(o.Sch, o.Nm, o.Tp, o.Perm, user));
                 }
                 else
                 {
-                    stm.Add("REVOKE " + o.Perm + " ON " + obj + " FROM " + user);
-                    inv.Add("GRANT " + o.Perm + " ON " + obj + " TO " + user);
+                    stm.Add(db.D.Revoke(o.Sch, o.Nm, o.Tp, o.Perm, user));
+                    inv.Add(db.D.Grant(o.Sch, o.Nm, o.Tp, o.Perm, user));
                 }
             }
         }
@@ -1922,39 +2392,38 @@ class Matrix : Panel
                 if (pend.Contains(Key(u.Pid, ((Obj)r.Tag).Oid, ((Obj)r.Tag).Perm))) { addU.Add(u.Name); break; }
         }
         if (addU.Count > 0 && !UI.Ask("Эти логины ещё не добавлены в базу «" + db.Name + "»:\n  " + string.Join(", ", addU.ToArray()) + "\n\nДобавить их как пользователей БД и выдать права?")) return;
-        if (!UI.Ask("Применить изменений: " + stm.Count + "?\nВсё выполняется одной транзакцией — при ошибке откат.")) return;
+        string how = db.D.Transactional ? "Всё выполняется одной транзакцией — при ошибке откат." : "При ошибке уже выполненные команды будут отменены обратными командами.";
+        if (!UI.Ask("Применить изменений: " + stm.Count + "?\n" + how)) return;
+        var allStm = new List<string>(); var allInv = new List<string>();
+        foreach (string n in addU) { allStm.Add("CREATE USER " + App.Q(n) + " FOR LOGIN " + App.Q(n)); allInv.Add("DROP USER " + App.Q(n)); }
+        allStm.AddRange(stm); allInv.AddRange(inv);
         try
         {
-            db.InTx(delegate
-            {
-                foreach (string n in addU) db.Exec("CREATE USER " + App.Q(n) + " FOR LOGIN " + App.Q(n), null);
-                foreach (string s in stm) db.Exec(s, null);
-            });
+            db.Batch(allStm, allInv);
             App.Log("Применено изменений: " + stm.Count);
         }
-        catch (Exception ex) { App.Log("ОШИБКА: " + ex.Message); UI.Warn("Ошибка, ничего не изменено:\n" + ex.Message); return; }
-        inv.Reverse();
-        foreach (string n in addU) inv.Add("DROP USER " + App.Q(n));
-        History.Stack.Add(new UndoItem { Db = db.Name, Title = DateTime.Now.ToString("HH:mm") + " — изменений: " + stm.Count + (addU.Count > 0 ? ", новых пользователей БД: " + addU.Count : ""), Sql = inv });
+        catch (Exception ex) { App.Log("ОШИБКА: " + ex.Message); UI.Warn("Ошибка, изменения отменены:\n" + ex.Message); Reload(false); return; }
+        var undo = new List<string>(allInv); undo.Reverse();
+        History.Stack.Add(new UndoItem { Db = db.Name, Title = DateTime.Now.ToString("HH:mm") + " — изменений: " + stm.Count + (addU.Count > 0 ? ", новых пользователей БД: " + addU.Count : ""), Sql = undo });
         Reload(false);
         if (Changed != null) Changed();
     }
 
-    // откат последнего применения для этой базы (обратные команды одной транзакцией)
+    // откат последнего применения для этой базы (обратные команды)
     void Undo()
     {
         UndoItem it = null;
         for (int i = History.Stack.Count - 1; i >= 0; i--) if (History.Stack[i].Db == db.Name) { it = History.Stack[i]; break; }
         if (it == null) { UI.Info("Откатывать нечего: в этой сессии для базы «" + db.Name + "» изменений не применялось."); return; }
         if (pend.Count > 0 && !ConfirmDrop()) return;
-        if (!UI.Ask("Откатить применение: " + it.Title + "?\nБудет выполнено команд: " + it.Sql.Count + " (одной транзакцией).")) return;
+        if (!UI.Ask("Откатить применение: " + it.Title + "?\nБудет выполнено команд: " + it.Sql.Count + (db.D.Transactional ? " (одной транзакцией)." : "."))) return;
         try
         {
-            db.InTx(delegate { foreach (string s in it.Sql) db.Exec(s, null); });
+            db.Batch(it.Sql, null);
             History.Stack.Remove(it);
             App.Log("Откат выполнен: " + it.Title);
         }
-        catch (Exception ex) { App.Log("ОШИБКА отката: " + ex.Message); UI.Warn("Не удалось откатить, ничего не изменено:\n" + ex.Message); return; }
+        catch (Exception ex) { App.Log("ОШИБКА отката: " + ex.Message); UI.Warn("Не удалось откатить:\n" + ex.Message); return; }
         Reload(false);
         if (Changed != null) Changed();
     }
@@ -2035,7 +2504,7 @@ class MainForm : Form
 
         var hdr = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(12, 10, 12, 4) };
         hdr.Controls.Add(new Label { Text = "LoginChanger", AutoSize = true, Font = new Font("Segoe UI Semibold", 14f), Margin = new Padding(3, 2, 14, 0) });
-        hdr.Controls.Add(new Label { Text = db.Server + "  ›  " + db.Name + "  ›  " + db.Who, AutoSize = true, Tag = "muted", Margin = new Padding(3, 9, 14, 0) });
+        hdr.Controls.Add(new Label { Text = db.D.Title + "  ›  " + db.Server + "  ›  " + db.Name + "  ›  " + db.Who, AutoSize = true, Tag = "muted", Margin = new Padding(3, 9, 14, 0) });
         var bSw = new Button { Text = "Сменить сервер / БД", AutoSize = true };
         bSw.Click += delegate { Reconnect = true; Close(); };
         bTheme.Text = Theme.Label; bTheme.AutoSize = true;

@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>LoginChanger — права в MSSQL одной матрицей</title>
-<meta name="description" content="Портативная программа для Windows: управление пользователями и правами SQL Server галочками. Строки — представления, столбцы — пользователи. Без установки, 110 КБ, откат, шаблоны, массовое создание.">
+<title>LoginChanger — права в SQL Server, Firebird и MySQL одной матрицей</title>
+<meta name="description" content="Портативная программа для Windows: управление пользователями и правами SQL Server, Firebird и MySQL галочками. Строки — представления, столбцы — пользователи. Без установки, откат, шаблоны, массовое создание.">
 <link rel="icon" href="favicon.ico">
 <link rel="canonical" href="https://merdanochanov.github.io/LoginChanger/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="LoginChanger — права в MSSQL одной матрицей">
-<meta property="og:description" content="Галочки вместо T-SQL. Портативно, Windows 7 → 11, SQL Server 2012–2022, 110 КБ.">
+<meta property="og:title" content="LoginChanger — права в SQL Server, Firebird и MySQL одной матрицей">
+<meta property="og:description" content="Галочки вместо T-SQL. Портативно, Windows 7 → 11, SQL Server, Firebird, MySQL.">
 <meta property="og:image" content="https://merdanochanov.github.io/LoginChanger/img/og.png">
 <meta property="og:url" content="https://merdanochanov.github.io/LoginChanger/">
 <meta name="twitter:card" content="summary_large_image">
@@ -22,7 +22,7 @@
 <header class="nav"><div class="wrap">
   <a class="brand" href="#top"><img src="favicon.ico" alt="">LoginChanger</a>
   <nav>
-    <a href="#features">Возможности</a><a href="#shots">Скриншоты</a><a href="#how">Как это работает</a><a href="#faq">Вопросы</a>
+    <a href="#features">Возможности</a><a href="#db">СУБД</a><a href="#shots">Скриншоты</a><a href="#how">Как это работает</a><a href="#faq">Вопросы</a>
     <a href="manual.html">Инструкция</a><a class="keep" href="https://github.com/MerdanOchanov/LoginChanger">GitHub ★</a>
   </nav>
   <button class="tbtn" id="theme" title="Тема">◐</button>
@@ -30,8 +30,8 @@
 
 <main id="top">
 <section class="hero"><div class="wrap">
-  <h1>Права в SQL Server — <span>одной матрицей</span></h1>
-  <p class="lead">Строки — представления, столбцы — пользователи, а доступ — это галочка. Создавайте пользователей, выдавайте и отзывайте права и откатывайте ошибки за секунды, без единой строки T-SQL.</p>
+  <h1>Права в базах данных — <span>одной матрицей</span></h1>
+  <p class="lead">SQL Server, Firebird и MySQL. Строки — представления, столбцы — пользователи, а доступ — это галочка. Создавайте пользователей, выдавайте и отзывайте права и откатывайте ошибки за секунды, без единой строки T-SQL.</p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe">⬇ Скачать LoginChanger.exe</a>
     <a class="btn" href="https://github.com/MerdanOchanov/LoginChanger">★ Звезда на GitHub</a>
@@ -39,7 +39,7 @@
   </div>
   <div class="chips">
     <span class="chip">Один файл · 110 КБ</span><span class="chip">Без установки</span><span class="chip">Windows 7 → 11 · Server 2019</span>
-    <span class="chip">SQL Server 2012 – 2022</span><span class="chip">Светлая и тёмная тема</span><span class="chip">MIT</span>
+    <span class="chip">SQL Server · Firebird · MySQL</span><span class="chip">Светлая и тёмная тема</span><span class="chip">MIT</span>
   </div>
   <figure class="shot"><img src="img/matrix_clean.png" alt="Матрица прав: пользователи в столбцах, представления в строках" width="1260" height="840"></figure>
 </div></section>
@@ -59,7 +59,7 @@
 
 <section id="features"><div class="wrap">
   <h2>Всё для ежедневной работы с доступом</h2>
-  <p class="sub">Небольшая утилита, которая закрывает 95% рутинных операций с правами.</p>
+  <p class="sub">Небольшая утилита, которая закрывает почти все рутинные операции с правами.</p>
   <div class="grid g3">
     <div class="card"><div class="ico">▦</div><h3>Матрица прав</h3><p>Представления — SELECT, процедуры и функции — EXECUTE, таблицы — SELECT. Зелёные ячейки — доступ есть, красные — запрещено.</p></div>
     <div class="card"><div class="ico">☑</div><h3>Массовая расстановка</h3><p>«Все» по столбцу и по строке, диапазон по <kbd>Shift</kbd>, выбор ячеек по <kbd>Ctrl</kbd>. Крупные чекбоксы, срабатывают по клику в любом месте ячейки.</p></div>
@@ -67,6 +67,7 @@
     <div class="card"><div class="ico">👤</div><h3>Быстрое создание</h3><p>Новый логин и пользователь БД с генератором пароля (8 символов, легко вводить), права по шаблону или «как у другого».</p></div>
     <div class="card"><div class="ico">⎘</div><h3>Массовое создание</h3><p>Вставьте список логинов — получите готовую таблицу «логин — пароль — результат» и экспорт в CSV.</p></div>
     <div class="card"><div class="ico">↺</div><h3>Откат последнего применения</h3><p>Все изменения идут одной транзакцией, а после применения их можно отменить одной кнопкой.</p></div>
+    <div class="card"><div class="ico">🗄</div><h3>Три СУБД в одной программе</h3><p>SQL Server работает «из коробки», Firebird и MySQL — через уже установленные в Windows ODBC-драйверы. Один и тот же привычный интерфейс.</p></div>
     <div class="card"><div class="ico">🛟</div><h3>«Сироты» и логины без БД</h3><p>Логин есть, а пользователя нет? Пользователь есть, а логина нет, даже учётка Windows удалена? Всё это выявляется и чинится.</p></div>
     <div class="card"><div class="ico">🛡</div><h3>Защита администраторов</h3><p>sa, dbo, sysadmin и db_owner не показываются и не меняются. Пароли не хранятся и не попадают в журнал.</p></div>
     <div class="card"><div class="ico">⤓</div><h3>Журнал и экспорт</h3><p>Каждое действие — в окне журнала и в файле. Матрицу и список пользователей можно выгрузить в CSV (открывается в Excel).</p></div>
@@ -86,7 +87,23 @@
   </div>
 </div></section>
 
-<section id="how"><div class="wrap">
+<section id="db"><div class="wrap">
+  <h2>Одна матрица — разные СУБД</h2>
+  <p class="sub">Выберите СУБД на экране подключения, остальное работает одинаково: те же вкладки, фильтры, откат и экспорт.</p>
+  <div class="grid g2">
+    <figure><div class="shot"><img src="img/matrix_fb_clean.png" alt="Матрица прав для Firebird" loading="lazy"></div><figcaption>Firebird: права SELECT и EXECUTE на объекты базы</figcaption></figure>
+    <figure><div class="shot"><img src="img/matrix_my.png" alt="Матрица прав для MySQL" loading="lazy"></div><figcaption>MySQL: учётные записи вида имя@хост</figcaption></figure>
+  </div>
+  <table class="compare" style="margin-top:26px">
+    <tr><th>СУБД</th><th>Подключение</th><th>Особенности</th></tr>
+    <tr><td><strong>SQL Server</strong> 2012–2022</td><td>встроенный клиент</td><td>«сироты», логины без базы, DENY, откат одной транзакцией</td></tr>
+    <tr><td><strong>Firebird</strong> 3+</td><td>ODBC</td><td>пользователи общие для сервера, права на объекты базы</td></tr>
+    <tr><td><strong>MySQL</strong> 8</td><td>ODBC</td><td>имя@хост; DDL не откатывается транзакцией — при ошибке выполняются обратные команды</td></tr>
+    <tr><td>PostgreSQL</td><td colspan="2">в планах</td></tr>
+  </table>
+</div></section>
+
+<section id="how" class="alt"><div class="wrap">
   <h2>Три шага до результата</h2>
   <p class="sub">Никакой установки: скачали, запустили, подключились.</p>
   <div class="steps">
@@ -110,9 +127,10 @@
   <h2>Частые вопросы</h2><p class="sub">Коротко о главном</p>
   <details><summary>Что нужно для запуска?</summary><p>Windows 7 SP1 / 10 / 11 / Server 2019 с .NET Framework 4.0+ (в Windows 10 и новее он уже есть) и права администратора SQL Server: вход через Windows или <code>sa</code>. Дополнительные драйверы не нужны.</p></details>
   <details><summary>Это точно портативно?</summary><p>Да. Один файл. Рядом создаются только папки <code>logs</code>, <code>templates</code> и файл <code>loginchanger.ini</code> (сервер, база, тема — без паролей).</p></details>
-  <details><summary>С какими версиями SQL Server работает?</summary><p>Рассчитано на SQL Server 2012–2022. Автор тестирует на 2019; если найдёте проблему на другой версии — напишите в Issues.</p></details>
+  <details><summary>С какими СУБД и версиями работает?</summary><p>SQL Server 2012–2022 (проверено на 2019), Firebird 3+ (проверено на 5.0) и MySQL 8 (проверено на 8.0). Для Firebird и MySQL нужен установленный ODBC-драйвер. Если найдёте проблему на другой версии — напишите в Issues.</p></details>
   <details><summary>Что если я случайно выдал лишнее?</summary><p>Нажмите «Откатить последнее» — обратные команды выполнятся одной транзакцией. Откат хранится до закрытия программы; все команды также записаны в журнал.</p></details>
-  <details><summary>Будет ли поддержка PostgreSQL, MySQL, Firebird?</summary><p>Это в планах. Следите за репозиторием или поставьте звезду, чтобы не пропустить релиз.</p></details>
+  <details><summary>А PostgreSQL?</summary><p>В планах, следующий на очереди. Следите за репозиторием или поставьте звезду, чтобы не пропустить релиз.</p></details>
+  <details><summary>Откат работает в MySQL?</summary><p>Да, но у MySQL права нельзя откатить транзакцией: при ошибке программа сама выполняет обратные команды для уже применённых изменений, а «Откатить последнее» возвращает прошлое состояние.</p></details>
   <details><summary>Это бесплатно?</summary><p>Да, лицензия MIT: используйте в работе, меняйте, распространяйте.</p></details>
 </div></section>
 
@@ -124,7 +142,7 @@
     <a class="btn" href="https://github.com/MerdanOchanov/LoginChanger">★ Поставить звезду</a>
     <a class="btn" href="https://github.com/MerdanOchanov/LoginChanger/issues">💬 Предложить идею</a>
   </div>
-  <p class="sub" style="margin:26px auto 0;font-size:15px"><strong>English:</strong> LoginChanger is a portable, 110&nbsp;KB Windows tool that manages SQL Server users and permissions through a checkbox matrix (views/procedures × users), with one-click undo, bulk user creation and password generation. No installer, no extra drivers. <a href="https://github.com/MerdanOchanov/LoginChanger#english">Read more</a>.</p>
+  <p class="sub" style="margin:26px auto 0;font-size:15px"><strong>English:</strong> LoginChanger is a portable, ~110&nbsp;KB Windows tool that manages SQL Server, Firebird and MySQL users and permissions through a checkbox matrix (views/procedures × users), with one-click undo, bulk user creation and password generation. No installer, no extra drivers. <a href="https://github.com/MerdanOchanov/LoginChanger#english">Read more</a>.</p>
 </div></section>
 </main>
 

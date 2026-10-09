@@ -4,13 +4,15 @@
 
 # LoginChanger
 
-**Права в SQL Server — одной матрицей.**<br>
+**Права в SQL Server, Firebird и MySQL — одной матрицей.**<br>
 Галочки вместо T-SQL: строки — представления, столбцы — пользователи.
 
 [![Скачать](https://img.shields.io/github/v/release/MerdanOchanov/LoginChanger?label=%D1%81%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C&color=2563eb)](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe)
 [![Build](https://github.com/MerdanOchanov/LoginChanger/actions/workflows/build.yml/badge.svg)](https://github.com/MerdanOchanov/LoginChanger/actions/workflows/build.yml)
 ![Platform](https://img.shields.io/badge/Windows-7%20%E2%86%92%2011%20%C2%B7%20Server%202019-0078d4)
 ![SQL Server](https://img.shields.io/badge/SQL%20Server-2012%E2%80%932022-cc2927)
+![Firebird](https://img.shields.io/badge/Firebird-3%2B-f40f02)
+![MySQL](https://img.shields.io/badge/MySQL-8-00758f)
 ![Size](https://img.shields.io/badge/%D1%80%D0%B0%D0%B7%D0%BC%D0%B5%D1%80-110%20%D0%9A%D0%91-16a34a)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -36,13 +38,26 @@
 - 🛡 **Защита** — `sa`, `dbo`, sysadmin и db_owner не показываются и не меняются
 - 🌗 Светлая/тёмная тема, адаптивный интерфейс, журнал действий, экспорт в CSV (Excel)
 
+## Поддерживаемые СУБД
+
+| СУБД | Как подключается | Что умеет |
+|---|---|---|
+| **SQL Server** 2012–2022 | встроенный клиент, драйверы не нужны | всё: матрица, пользователи и логины, «сироты», DENY, откат одной транзакцией |
+| **Firebird** 3+ | ODBC-драйвер (Firebird/InterBase ODBC) | матрица SELECT/EXECUTE, создание и удаление пользователей, пароли, шаблоны, откат |
+| **MySQL** 8 | ODBC-драйвер (MySQL Connector/ODBC) | то же; учётные записи вида `имя@хост`; DDL в MySQL не откатывается транзакцией, поэтому при ошибке выполненные команды отменяются обратными |
+| PostgreSQL | в планах | |
+
+Для Firebird и MySQL используется драйвер, уже установленный в Windows: программа сама находит его в списке ODBC. Права на уровне базы (например, `GRANT SELECT ON db.*` в MySQL) в матрице не показываются — только явные права на объекты.
+
+<img src="docs/img/matrix_fb_clean.png" alt="Матрица прав для Firebird" width="48%"> <img src="docs/img/matrix_my.png" alt="Матрица прав для MySQL" width="48%">
+
 ## Быстрый старт
 
 1. Скачайте [`LoginChanger.exe`](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe) — **установка не нужна**.
-2. Запустите, укажите сервер, войдите через Windows или `sa`.
+2. Запустите, выберите СУБД, укажите сервер, войдите (Windows или `sa` для SQL Server; логин и пароль для Firebird и MySQL).
 3. Выберите базу (список появляется после успешного входа) — и расставляйте галочки.
 
-**Требования:** Windows 7 SP1 / 10 / 11 / Server 2019 с .NET Framework 4.0+ (в Windows 10+ уже есть) и вход администратора SQL Server. Дополнительные драйверы не нужны. Проверено на SQL Server 2019; запросы используют системные каталоги, доступные с версии 2012.
+**Требования:** Windows 7 SP1 / 10 / 11 / Server 2019 с .NET Framework 4.0+ (в Windows 10+ уже есть) и вход администратора SQL Server. Дополнительные драйверы не нужны. Проверено на SQL Server 2019, Firebird 5.0 и MySQL 8.0; запросы используют системные каталоги, доступные с версии 2012.
 
 ## Скриншоты
 
@@ -73,9 +88,10 @@ build.bat
 ## Дорожная карта
 
 - [x] SQL Server 2012–2022
+- [x] Firebird 3+
+- [x] MySQL 8
 - [ ] PostgreSQL
-- [ ] MySQL / MariaDB
-- [ ] Firebird
+- [ ] MariaDB (не проверялась)
 - [ ] Права на столбцы и схемы
 
 Нужна другая СУБД или функция? [Создайте обсуждение](https://github.com/MerdanOchanov/LoginChanger/issues) — идеи приветствуются. Если проект полезен, поставьте ⭐ — так его найдут другие администраторы.
@@ -94,4 +110,4 @@ Pull request'ы и баг-репорты приветствуются: опиш�
 
 **LoginChanger** is a portable (≈110 KB, single `.exe`, no installer, no extra drivers) Windows tool for managing **SQL Server users and permissions through a checkbox matrix**: rows are views / procedures / tables, columns are users. It supports bulk user creation with generated passwords, templates, one-click undo, orphaned-user repair (even when the Windows account no longer exists), filters, CSV export and light/dark themes. All changes are applied in a single transaction; `sa`, `dbo`, sysadmins and db_owners are never touched.
 
-**Download:** [LoginChanger.exe](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe) · **Requirements:** Windows 7 SP1–11 / Server 2019 with .NET Framework 4.0+, SQL Server 2012–2022 admin login. **Build:** run `build.bat`. **License:** MIT. PostgreSQL, MySQL and Firebird support is on the roadmap.
+**Download:** [LoginChanger.exe](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe) · **Requirements:** Windows 7 SP1–11 / Server 2019 with .NET Framework 4.0+, SQL Server 2012–2022 admin login. **Build:** run `build.bat`. **License:** MIT. Besides SQL Server it works with **Firebird 3+** and **MySQL 8** through the ODBC drivers already installed in Windows; PostgreSQL is on the roadmap.
