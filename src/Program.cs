@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Data.Sql;
 using System.Data.Common;
+using System.Xml.Linq;
 using System.Data.SqlClient;
 using System.Drawing;
 using System.IO;
@@ -318,6 +319,13 @@ abstract class Dialect
     public abstract void CreateUser(string name, string pwd);
     public abstract void DropUser(string name);
     public abstract void ChangePassword(string name, string pwd);
+    // описания объектов
+    public virtual bool DescLocal(string tp) { return false; }
+    public abstract void SetDescription(string sch, string nm, string tp, string text, string src);
+    public abstract string DescScript(string sch, string nm, string tp, string text);
+    public abstract DataTable Meta(DataTable objs, int maxDef);      // oid, cols, def — для ИИ
+    protected static DataTable MetaTbl() { return Tbl("oid", "cols", "def"); }
+    protected static string Join40(List<string> l) { if (l == null) return ""; return string.Join(", ", (l.Count > 40 ? l.GetRange(0, 40) : l).ToArray()); }
 
     protected static DataTable Tbl(params string[] cols)
     {
@@ -349,7 +357,7 @@ class MssqlDialect : Dialect
     public override DataTable Objects(string[] types)
     {
         var tl = new List<string>(); foreach (string t in types) tl.Add("'" + t + "'");
-        return db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp, CONVERT(nvarchar(2000), ep.value) AS descr FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id LEFT JOIN sys.extended_properties ep ON ep.class=1 AND ep.minor_id=0 AND ep.major_id=o.object_id AND ep.name=N'MS_Description' WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name");
+        return db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp, CONVERT(nvarchar(2000), ep.value) AS descr, CONVERT(nvarchar(200), ep2.value) AS src FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id LEFT JOIN sys.extended_properties ep ON ep.class=1 AND ep.minor_id=0 AND ep.major_id=o.object_id AND ep.name=N'MS_Description' LEFT JOIN sys.extended_properties ep2 ON ep2.class=1 AND ep2.minor_id=0 AND ep2.major_id=o.object_id AND ep2.name=N'LC_Source' WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name");
     }
     public override DataTable Users()
     {
@@ -380,6 +388,40 @@ class MssqlDialect : Dialect
     public override string Revoke(string sch, string nm, string tp, string perm, string user) { return "REVOKE " + perm + " ON " + Obj(sch, nm) + " FROM " + App.Q(user); }
     public override string Deny(string sch, string nm, string tp, string perm, string user) { return "DENY " + perm + " ON " + Obj(sch, nm) + " TO " + App.Q(user); }
     public override bool UserExists(string name) { return db.Count("SELECT COUNT(*) FROM sys.database_principals WHERE name=@n AND type IN ('S','U','G')", "@n", name) > 0; }
+    static string Lvl(string tp) { switch (tp) { case "V": return "VIEW"; case "U": return "TABLE"; case "P": case "PC": return "PROCEDURE"; default: return "FUNCTION"; } }
+    void Prop(string sch, string nm, string tp, string name, string val)
+    {
+        string full = App.Q(sch) + "." + App.Q(nm);
+        bool ex = db.Count("SELECT COUNT(*) FROM sys.extended_properties WHERE class=1 AND minor_id=0 AND major_id=OBJECT_ID(@o) AND name=@n", "@o", full, "@n", name) > 0;
+        string args = ", @level0type=N'SCHEMA', @level0name=" + App.L(sch) + ", @level1type=N'" + Lvl(tp) + "', @level1name=" + App.L(nm);
+        if (val.Length == 0) { if (ex) db.Exec("EXEC sys.sp_dropextendedproperty @name=" + App.L(name) + args, null); return; }
+        if (val.Length > 3750) val = val.Substring(0, 3750);
+        db.Exec("EXEC sys." + (ex ? "sp_updateextendedproperty" : "sp_addextendedproperty") + " @name=" + App.L(name) + ", @value=" + App.L(val) + args, null);
+    }
+    public override void SetDescription(string sch, string nm, string tp, string text, string src) { Prop(sch, nm, tp, "MS_Description", text); Prop(sch, nm, tp, "LC_Source", src ?? ""); }
+    public override string DescScript(string sch, string nm, string tp, string text)
+    {
+        if (text.Length == 0) return "-- пустое описание для " + sch + "." + nm + " пропущено";
+        string full = App.L(App.Q(sch) + "." + App.Q(nm));
+        string args = ", @level0type=N'SCHEMA', @level0name=" + App.L(sch) + ", @level1type=N'" + Lvl(tp) + "', @level1name=" + App.L(nm);
+        return "IF OBJECT_ID(" + full + ") IS NOT NULL\nBEGIN\n  IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class=1 AND minor_id=0 AND major_id=OBJECT_ID(" + full + ") AND name=N'MS_Description')\n    EXEC sys.sp_updateextendedproperty @name=N'MS_Description', @value=" + App.L(text) + args + ";\n  ELSE\n    EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=" + App.L(text) + args + ";\nEND\nGO";
+    }
+    public override DataTable Meta(DataTable objs, int maxDef)
+    {
+        var def = new Dictionary<int, string>(); var cols = new Dictionary<int, List<string>>();
+        if (maxDef > 0)
+            foreach (DataRow r in db.Query("SELECT m.object_id AS oid, LEFT(m.definition, " + maxDef + ") AS def FROM sys.sql_modules m JOIN sys.objects o ON o.object_id=m.object_id WHERE o.is_ms_shipped=0").Rows)
+                def[Convert.ToInt32(r["oid"])] = Convert.ToString(r["def"]);
+        foreach (DataRow r in db.Query("SELECT c.object_id AS oid, c.name AS nm, ty.name AS tn FROM sys.columns c JOIN sys.objects o ON o.object_id=c.object_id JOIN sys.types ty ON ty.user_type_id=c.user_type_id WHERE o.is_ms_shipped=0 AND o.type IN ('V','U') ORDER BY c.object_id, c.column_id").Rows)
+        {
+            int k = Convert.ToInt32(r["oid"]); List<string> l; if (!cols.TryGetValue(k, out l)) cols[k] = l = new List<string>();
+            l.Add(Convert.ToString(r["nm"]) + " " + Convert.ToString(r["tn"]));
+        }
+        DataTable t = MetaTbl();
+        foreach (DataRow r in objs.Rows) { int k = Convert.ToInt32(r["oid"]); string d; List<string> l; def.TryGetValue(k, out d); cols.TryGetValue(k, out l); t.Rows.Add(k, Join40(l), d ?? ""); }
+        return t;
+    }
+
     public override bool IsProtected(string name)
     {
         string l = name.ToLower();
@@ -457,6 +499,35 @@ UNION ALL SELECT TRIM(RDB$FUNCTION_NAME), 'FN', CAST(RDB$DESCRIPTION AS VARCHAR(
     {
         return db.Query("SELECT 1 FROM SEC$USERS WHERE SEC$USER_NAME=" + App.S(Canon(name))).Rows.Count > 0;
     }
+    static string Kind(string tp) { return tp == "V" ? "VIEW" : tp == "U" ? "TABLE" : tp == "P" ? "PROCEDURE" : "FUNCTION"; }
+    public override void SetDescription(string sch, string nm, string tp, string text, string src)
+    {
+        db.Exec("COMMENT ON " + Kind(tp) + " " + Q(nm) + " IS " + (text.Length == 0 ? "NULL" : App.S(text)), null);
+    }
+    public override string DescScript(string sch, string nm, string tp, string text)
+    {
+        return "COMMENT ON " + Kind(tp) + " " + Q(nm) + " IS " + (text.Length == 0 ? "NULL" : App.S(text)) + ";";
+    }
+    public override DataTable Meta(DataTable objs, int maxDef)
+    {
+        int md = Math.Min(maxDef, 4000);
+        var cols = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase); var def = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (DataRow r in db.Query("SELECT TRIM(RDB$RELATION_NAME) AS r, TRIM(RDB$FIELD_NAME) AS f FROM RDB$RELATION_FIELDS ORDER BY 1, RDB$FIELD_POSITION").Rows)
+        { string k = S(r["r"]); List<string> l; if (!cols.TryGetValue(k, out l)) cols[k] = l = new List<string>(); l.Add(S(r["f"])); }
+        if (md > 0)
+        {
+            foreach (DataRow r in db.Query("SELECT TRIM(RDB$RELATION_NAME) AS n, CAST(RDB$VIEW_SOURCE AS VARCHAR(" + md + ")) AS d FROM RDB$RELATIONS WHERE RDB$VIEW_SOURCE IS NOT NULL").Rows) def["V:" + S(r["n"])] = S(r["d"]);
+            foreach (DataRow r in db.Query("SELECT TRIM(RDB$PROCEDURE_NAME) AS n, CAST(RDB$PROCEDURE_SOURCE AS VARCHAR(" + md + ")) AS d FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_SOURCE IS NOT NULL").Rows) def["P:" + S(r["n"])] = S(r["d"]);
+        }
+        DataTable t = MetaTbl();
+        foreach (DataRow r in objs.Rows)
+        {
+            string n = S(r["nm"]), tp = S(r["tp"]); string d; List<string> l; def.TryGetValue(tp + ":" + n, out d); cols.TryGetValue(n, out l);
+            t.Rows.Add(Convert.ToInt32(r["oid"]), Join40(l), d ?? "");
+        }
+        return t;
+    }
+
     public override bool IsProtected(string name)
     {
         string n = Canon(name);
@@ -486,7 +557,47 @@ class MySqlDialect : Dialect
     public override string Canon(string name) { string u, h; Split(name.Trim(), out u, out h); return u + "@" + h; }
     public override string UserRef(string user) { string u, h; Split(user, out u, out h); return Lit(u) + "@" + Lit(h); }
 
+    public override bool DescLocal(string tp) { return tp == "V"; }
     public override DataTable Objects(string[] types)
+    {
+        DataTable t = ObjectsRaw(types);
+        var sc = Sidecar.Load(db);
+        foreach (DataRow r in t.Rows) { string v; if (Convert.ToString(r["tp"]) == "V" && sc.TryGetValue(Convert.ToString(r["nm"]), out v)) r["descr"] = v; }
+        return t;
+    }
+    public override void SetDescription(string sch, string nm, string tp, string text, string src)
+    {
+        if (tp == "V") { Sidecar.Set(db, nm, text); return; }
+        if (text.Length > 1000) text = text.Substring(0, 1000);
+        if (tp == "U") db.Exec("ALTER TABLE " + Q(db.Name) + "." + Q(nm) + " COMMENT = " + Lit(text), null);
+        else db.Exec("ALTER " + (tp == "P" ? "PROCEDURE " : "FUNCTION ") + Q(db.Name) + "." + Q(nm) + " COMMENT " + Lit(text), null);
+    }
+    public override string DescScript(string sch, string nm, string tp, string text)
+    {
+        if (tp == "V") return "-- представление " + nm + ": у MySQL нет комментариев к представлениям, описание хранится в файле программы";
+        if (tp == "U") return "ALTER TABLE " + Q(db.Name) + "." + Q(nm) + " COMMENT = " + Lit(text) + ";";
+        return "ALTER " + (tp == "P" ? "PROCEDURE " : "FUNCTION ") + Q(db.Name) + "." + Q(nm) + " COMMENT " + Lit(text) + ";";
+    }
+    public override DataTable Meta(DataTable objs, int maxDef)
+    {
+        string d = Lit(db.Name);
+        var cols = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase); var def = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (DataRow r in db.Query("SELECT TABLE_NAME AS t, COLUMN_NAME AS c, COLUMN_TYPE AS ty FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + d + " ORDER BY TABLE_NAME, ORDINAL_POSITION").Rows)
+        { string k = S(r["t"]); List<string> l; if (!cols.TryGetValue(k, out l)) cols[k] = l = new List<string>(); l.Add(S(r["c"]) + " " + S(r["ty"])); }
+        if (maxDef > 0)
+        {
+            foreach (DataRow r in db.Query("SELECT TABLE_NAME AS n, LEFT(VIEW_DEFINITION, " + maxDef + ") AS d FROM information_schema.VIEWS WHERE TABLE_SCHEMA=" + d).Rows) def["V:" + S(r["n"])] = S(r["d"]);
+            foreach (DataRow r in db.Query("SELECT ROUTINE_NAME AS n, ROUTINE_TYPE AS ty, LEFT(ROUTINE_DEFINITION, " + maxDef + ") AS d FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=" + d).Rows) def[(S(r["ty"]).ToUpper() == "PROCEDURE" ? "P:" : "FN:") + S(r["n"])] = S(r["d"]);
+        }
+        DataTable t = MetaTbl();
+        foreach (DataRow r in objs.Rows)
+        {
+            string n = S(r["nm"]), tp = S(r["tp"]); string dd; List<string> l; def.TryGetValue(tp + ":" + n, out dd); cols.TryGetValue(n, out l);
+            t.Rows.Add(Convert.ToInt32(r["oid"]), Join40(l), dd ?? "");
+        }
+        return t;
+    }
+    DataTable ObjectsRaw(string[] types)
     {
         string d = Lit(db.Name);
         DataTable src = db.Query("SELECT TABLE_NAME AS nm, CASE WHEN TABLE_TYPE='VIEW' THEN 'V' ELSE 'U' END AS tp, CASE WHEN TABLE_COMMENT='VIEW' THEN '' ELSE TABLE_COMMENT END AS d FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + d + " AND TABLE_TYPE IN ('BASE TABLE','VIEW') " +
@@ -580,6 +691,11 @@ static class Cfg
     public static string CsvDelim = ";", CsvEnc = "utf8bom", CsvMark = "+";
     public static bool LogToFile = true; public static int LogDays = 30;
     public static string TplDir = "";
+    public static string AiUrl = "", AiKey = "", AiModel = "", RulesFile = "";
+    public static int AiBatch = 15, AiMaxLen = 200, AiMaxDef = 2500, AiTimeout = 120;
+    public static bool AiSendDef = true;
+    public const string DefaultStyle = "Одно предложение на русском (до {max} символов): что показывает объект, ключевая сущность и период, если понятно. Без слов «таблица», «представление», «view». Для архивных (_OLD) и временных (_TEMP) копий добавляй пометку в скобках. Не повторяй имя объекта.";
+    public static string AiStyle = DefaultStyle;
     public static List<string> ViewPerms = new List<string>(new[] { "SELECT" });
     public static List<string> TablePerms = new List<string>(new[] { "SELECT" });
 
@@ -617,6 +733,11 @@ static class Cfg
         CsvMark = S(d, "s_csv_mark", "+"); if (CsvMark.Length == 0 || CsvMark.Length > 3) CsvMark = "+";
         LogToFile = B(d, "s_log_file", true); LogDays = I(d, "s_log_days", 30, 1, 365);
         TplDir = S(d, "s_tpl_dir", "");
+        AiUrl = S(d, "s_ai_url", ""); AiKey = Secret.Unprotect(S(d, "s_ai_key", "")); AiModel = S(d, "s_ai_model", "");
+        AiBatch = I(d, "s_ai_batch", 15, 1, 50); AiSendDef = B(d, "s_ai_def", true); AiMaxLen = I(d, "s_ai_maxlen", 200, 60, 500);
+        AiMaxDef = I(d, "s_ai_maxdef", 2500, 200, 8000); AiTimeout = I(d, "s_ai_timeout", 120, 10, 600);
+        AiStyle = S(d, "s_ai_style", DefaultStyle).Replace("\\n", "\n"); if (AiStyle.Trim().Length == 0) AiStyle = DefaultStyle;
+        RulesFile = S(d, "s_rules_file", "");
         ViewPerms = Perms(d, "s_view_perms", ViewAll); TablePerms = Perms(d, "s_table_perms", TableAll);
     }
 
@@ -625,6 +746,7 @@ static class Cfg
         Theme = "light"; ConfirmApply = true; ConfirmUndo = true; PwdLen = 8; PwdSymbol = false; PolicyOff = false;
         ConnTimeout = 10; CmdTimeout = 60; TrustCert = true; Encrypt = false; RememberServers = true; ShowDescr = true;
         CsvDelim = ";"; CsvEnc = "utf8bom"; CsvMark = "+"; LogToFile = true; LogDays = 30; TplDir = "";
+        AiUrl = ""; AiKey = ""; AiModel = ""; AiBatch = 15; AiSendDef = true; AiMaxLen = 200; AiMaxDef = 2500; AiTimeout = 120; AiStyle = DefaultStyle; RulesFile = "";
         ViewPerms = new List<string>(new[] { "SELECT" }); TablePerms = new List<string>(new[] { "SELECT" });
     }
 
@@ -641,6 +763,9 @@ static class Cfg
         d["s_csv_delim"] = CsvDelim; d["s_csv_enc"] = CsvEnc; d["s_csv_mark"] = CsvMark;
         d["s_log_file"] = F(LogToFile); d["s_log_days"] = LogDays.ToString();
         d["s_tpl_dir"] = TplDir;
+        d["s_ai_url"] = AiUrl; d["s_ai_key"] = Secret.Protect(AiKey); d["s_ai_model"] = AiModel; d["s_ai_batch"] = AiBatch.ToString();
+        d["s_ai_def"] = F(AiSendDef); d["s_ai_maxlen"] = AiMaxLen.ToString(); d["s_ai_maxdef"] = AiMaxDef.ToString(); d["s_ai_timeout"] = AiTimeout.ToString();
+        d["s_ai_style"] = AiStyle.Replace("\r", "").Replace("\n", "\\n"); d["s_rules_file"] = RulesFile;
         d["s_view_perms"] = string.Join(",", ViewPerms.ToArray()); d["s_table_perms"] = string.Join(",", TablePerms.ToArray());
         if (!RememberServers) d.Remove("servers");
         App.SaveIni(d);
@@ -672,6 +797,9 @@ class SettingsForm : Form
              cRem = new CheckBox(), cDescr = new CheckBox(), cLog = new CheckBox();
     FlatCombo cDelim = new FlatCombo(), cCsvEnc = new FlatCombo(), cTheme = new FlatCombo();
     TextBox tMark = new TextBox(), tTpl = new TextBox();
+    TextBox tAiUrl = new TextBox(), tAiKey = new TextBox(), tAiModel = new TextBox(), tAiStyle = new TextBox(), tRules = new TextBox();
+    NumericUpDown nAiBatch = new NumericUpDown(), nAiMax = new NumericUpDown(), nAiTimeout = new NumericUpDown();
+    CheckBox cAiDef = new CheckBox();
     TableLayoutPanel tl;
 
     public SettingsForm()
@@ -736,6 +864,34 @@ class SettingsForm : Form
         };
         Row("Папка шаблонов:", pt);
         Note("Пусто — папка templates рядом с программой. Файл настроек: " + Path.Combine(App.Dir, "loginchanger.ini"));
+
+        Section("Описания объектов и ИИ");
+        tAiUrl.Width = 420; Row("Адрес сервиса ИИ:", tAiUrl);
+        Note("Любой OpenAI-совместимый: https://api.openai.com/v1 · http://localhost:11434/v1 (Ollama) · http://localhost:1234/v1 (LM Studio). Для локальных адресов подтверждение отправки не спрашивается.");
+        tAiKey.Width = 420; tAiKey.UseSystemPasswordChar = true; Row("Ключ API:", tAiKey);
+        tAiModel.Width = 300; Row("Модель:", tAiModel);
+        nAiBatch.Minimum = 1; nAiBatch.Maximum = 50; nAiBatch.Width = 80; Row("Объектов в одном запросе:", nAiBatch);
+        cAiDef.Text = "Отправлять тексты определений (SQL) — точнее описание, но виден код отчётов"; CheckRow(cAiDef);
+        nAiMax.Minimum = 60; nAiMax.Maximum = 500; nAiMax.Width = 80; Row("Максимальная длина описания:", nAiMax);
+        nAiTimeout.Minimum = 10; nAiTimeout.Maximum = 600; nAiTimeout.Width = 80; Row("Таймаут запроса, с:", nAiTimeout);
+        tAiStyle.Multiline = true; tAiStyle.Width = 420; tAiStyle.Height = 78; tAiStyle.ScrollBars = ScrollBars.Vertical; Row("Требования к тексту:", tAiStyle);
+        var pr = new Panel { Height = 32, MinimumSize = new Size(0, 32), Width = 420 };
+        var bRb = new Button { Text = "Обзор…", Dock = DockStyle.Right, Width = 90 }; tRules.Dock = DockStyle.Fill; pr.Controls.Add(tRules); pr.Controls.Add(bRb);
+        bRb.Click += delegate
+        {
+            using (var fd = new OpenFileDialog()) { fd.Filter = "Файлы правил (*.rules;*.txt)|*.rules;*.txt|Все файлы|*.*"; if (fd.ShowDialog(this) == DialogResult.OK) tRules.Text = fd.FileName; }
+        };
+        Row("Файл правил описаний:", pr);
+        var bAiTest = new Button { Text = "Проверить соединение с ИИ", AutoSize = true };
+        bAiTest.Click += delegate
+        {
+            ApplyToCfg(); bAiTest.Enabled = false; Cursor = Cursors.WaitCursor;
+            try { string a = Ai.Chat("Отвечай одним словом.", "Ответь словом: ок", CancellationToken.None); UI.Info("Соединение работает. Ответ модели: " + a.Trim()); }
+            catch (Exception ex) { UI.Warn(ex.Message); }
+            finally { bAiTest.Enabled = true; Cursor = Cursors.Default; }
+        };
+        Row("", bAiTest);
+        Note("Ключ хранится в зашифрованном виде (Windows DPAPI): расшифровать его может только ваша учётная запись Windows на этом компьютере. Данные таблиц на сервер ИИ не отправляются.");
 
         Section("Внешний вид");
         cTheme.Items.AddRange(new object[] { "Светлая", "Тёмная", "Как в системе" }); cTheme.Width = 220; Row("Тема:", cTheme);
@@ -811,9 +967,11 @@ class SettingsForm : Form
         tMark.Text = Cfg.CsvMark;
         cLog.Checked = Cfg.LogToFile; nLog.Value = Cfg.LogDays; tTpl.Text = Cfg.TplDir;
         cTheme.SelectedIndex = Cfg.Theme == "dark" ? 1 : Cfg.Theme == "auto" ? 2 : 0;
+        tAiUrl.Text = Cfg.AiUrl; tAiKey.Text = Cfg.AiKey; tAiModel.Text = Cfg.AiModel; nAiBatch.Value = Cfg.AiBatch; cAiDef.Checked = Cfg.AiSendDef;
+        nAiMax.Value = Cfg.AiMaxLen; nAiTimeout.Value = Cfg.AiTimeout; tAiStyle.Text = Cfg.AiStyle.Replace("\n", "\r\n"); tRules.Text = Cfg.RulesFile;
     }
 
-    void Collect()
+    void ApplyToCfg()
     {
         Cfg.ViewPerms = Marked(vp); Cfg.TablePerms = Marked(tp);
         Cfg.PwdLen = (int)nPwd.Value; Cfg.PwdSymbol = cSym.Checked; Cfg.PolicyOff = cPol.Checked;
@@ -825,7 +983,833 @@ class SettingsForm : Form
         Cfg.CsvMark = tMark.Text.Trim().Length == 0 ? "+" : tMark.Text.Trim();
         Cfg.LogToFile = cLog.Checked; Cfg.LogDays = (int)nLog.Value; Cfg.TplDir = tTpl.Text.Trim();
         Cfg.Theme = cTheme.SelectedIndex == 1 ? "dark" : cTheme.SelectedIndex == 2 ? "auto" : "light";
-        Cfg.Save();
+        Cfg.AiUrl = tAiUrl.Text.Trim(); Cfg.AiKey = tAiKey.Text.Trim(); Cfg.AiModel = tAiModel.Text.Trim(); Cfg.AiBatch = (int)nAiBatch.Value; Cfg.AiSendDef = cAiDef.Checked;
+        Cfg.AiMaxLen = (int)nAiMax.Value; Cfg.AiTimeout = (int)nAiTimeout.Value; Cfg.AiStyle = tAiStyle.Text.Trim().Length == 0 ? Cfg.DefaultStyle : tAiStyle.Text.Replace("\r\n", "\n").Trim();
+        Cfg.RulesFile = tRules.Text.Trim();
+    }
+
+    void Collect() { ApplyToCfg(); Cfg.Save(); }
+}
+
+// ===== описания объектов: модель, правила, файлы, ИИ =====
+class DescItem
+{
+    public int Oid; public string Sch = "", Nm = "", Tp = "";
+    public string Cur = "", CurSrc = "";       // что записано в базе сейчас (и откуда оно)
+    public string New, NewSrc = "", NewDetail = "";   // черновик (New == null — без изменений), источник и подробность (файл, модель)
+    public string CurStored = "";              // «код|подробность|дата» из базы
+    public bool Local;                         // описание хранится не в БД, а в файле рядом с программой
+    public string Full { get { return Sch.Length > 0 ? Sch + "." + Nm : Nm; } }
+    public bool Dirty { get { return New != null && (New != Cur || (NewSrc.Length > 0 && NewSrc != CurSrc)); } }
+    public string Shown { get { return New != null ? New : Cur; } }
+    public string ShownSrc { get { return New != null && NewSrc.Length > 0 ? NewSrc : CurSrc; } }
+    public static string Kind(string tp)
+    {
+        switch (tp)
+        {
+            case "V": return "представление";
+            case "U": return "таблица";
+            case "P": case "PC": return "процедура";
+            case "FN": case "FS": return "функция";
+            case "IF": case "TF": case "FT": return "табличная функция";
+            case "AF": return "агрегатная функция";
+        }
+        return tp;
+    }
+    public static string SrcName(string src)
+    {
+        switch (src)
+        {
+            case "manual": return "вручную";
+            case "file": return "файл";
+            case "rules": return "правила";
+            case "ai?": return "ИИ (не проверено)";
+            case "ai": return "ИИ (проверено)";
+        }
+        return "";
+    }
+    // LC_Source хранится как «код|подробность|дата»
+    public static string Detail(string stored) { if (stored == null) return ""; string[] p = stored.Split('|'); return p.Length > 1 ? p[1].Trim() : ""; }
+    public static string SrcCode(string stored) { if (stored == null) return ""; int i = stored.IndexOf('|'); return i < 0 ? stored.Trim() : stored.Substring(0, i).Trim(); }
+}
+
+// ----- правила: «регулярка → шаблон» + глоссарий (формат повторяет логику gen.py) -----
+// [strip]     префиксы, которые отбрасываются (AN_)
+// [entities]  КЛЮЧ = текст: сущность в начале имени после префикса, добавляется « — текст»
+// [tags]      СУФФИКС = текст: _OLD = архивная копия, добавляется « (текст)»
+// [exact]     ИМЯ = текст: точное имя
+// [rules]     регулярка => шаблон: {0} {1}… группы, {g1} — группа через глоссарий, {?1: текст} — если группа 1 не пуста
+// [rules_other] то же, но для имён без отбрасываемого префикса (если [strip] задан)
+// [extras]    регулярка => шаблон: дописывается к описанию (год, номер счёта)
+// [fallback]  prefixed = … / other = … ({rest} — имя без префикса)
+class RuleSet
+{
+    readonly List<string> strip = new List<string>();
+    readonly List<KeyValuePair<string, string>> entities = new List<KeyValuePair<string, string>>();
+    readonly List<KeyValuePair<string, string>> tags = new List<KeyValuePair<string, string>>();
+    readonly Dictionary<string, string> exact = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> gloss = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    readonly List<KeyValuePair<System.Text.RegularExpressions.Regex, string>> rules = new List<KeyValuePair<System.Text.RegularExpressions.Regex, string>>();
+    readonly List<KeyValuePair<System.Text.RegularExpressions.Regex, string>> extras = new List<KeyValuePair<System.Text.RegularExpressions.Regex, string>>();
+    readonly List<KeyValuePair<System.Text.RegularExpressions.Regex, string>> otherRules = new List<KeyValuePair<System.Text.RegularExpressions.Regex, string>>();
+    string fbPrefixed = "", fbOther = "";
+    public int Count { get { return rules.Count + exact.Count + entities.Count; } }
+    public Dictionary<string, string> Glossary { get { return gloss; } }
+
+    public static RuleSet Load(string path)
+    {
+        var rs = new RuleSet(); string sec = "";
+        foreach (string raw in File.ReadAllLines(path, Encoding.UTF8))
+        {
+            string l = raw.Trim();
+            if (l.Length == 0 || l[0] == '#') continue;
+            if (l[0] == '[' && l[l.Length - 1] == ']') { sec = l.Substring(1, l.Length - 2).Trim().ToLower(); continue; }
+            if (sec == "strip") { int q = l.IndexOf('='); rs.strip.Add((q >= 0 ? l.Substring(0, q) : l).Trim().ToUpperInvariant()); continue; }
+            if (sec == "rules" || sec == "rules_other" || sec == "extras")
+            {
+                int i = l.IndexOf("=>"); if (i < 0) continue;
+                var rx = new System.Text.RegularExpressions.Regex(l.Substring(0, i).Trim());
+                string tpl = l.Substring(i + 2).Trim();
+                if (tpl.Length >= 2 && tpl[0] == '"' && tpl[tpl.Length - 1] == '"') tpl = tpl.Substring(1, tpl.Length - 2);   // в кавычках — сохраняются пробелы по краям
+                var kv = new KeyValuePair<System.Text.RegularExpressions.Regex, string>(rx, tpl);
+                if (sec == "rules") rs.rules.Add(kv); else if (sec == "rules_other") rs.otherRules.Add(kv); else rs.extras.Add(kv);
+                continue;
+            }
+            int e = l.IndexOf('='); if (e < 0) continue;
+            string k = l.Substring(0, e).Trim(), v = l.Substring(e + 1).Trim();
+            switch (sec)
+            {
+                case "entities": rs.entities.Add(new KeyValuePair<string, string>(k.ToUpperInvariant(), v)); rs.gloss[k] = v; break;
+                case "tags": rs.tags.Add(new KeyValuePair<string, string>(k.ToUpperInvariant(), v)); break;
+                case "exact": rs.exact[k] = v; break;
+                case "glossary": rs.gloss[k] = v; break;
+                case "fallback": if (k == "prefixed") rs.fbPrefixed = v; else if (k == "other") rs.fbOther = v; break;
+            }
+        }
+        rs.entities.Sort(delegate(KeyValuePair<string, string> a, KeyValuePair<string, string> b) { return b.Key.Length - a.Key.Length; });
+        return rs;
+    }
+
+    string Expand(string tpl, System.Text.RegularExpressions.Match m)
+    {
+        // условные вставки {?N: текст}
+        tpl = System.Text.RegularExpressions.Regex.Replace(tpl, @"\{\?(\d+):((?:[^{}]|\{[^{}]*\})*)\}", delegate(System.Text.RegularExpressions.Match c)
+        {
+            int n = int.Parse(c.Groups[1].Value);
+            return m != null && n < m.Groups.Count && m.Groups[n].Success && m.Groups[n].Value.Length > 0 ? c.Groups[2].Value : "";
+        });
+        tpl = System.Text.RegularExpressions.Regex.Replace(tpl, @"\{g(\d+)\}", delegate(System.Text.RegularExpressions.Match c)
+        {
+            int n = int.Parse(c.Groups[1].Value); string s = m != null && n < m.Groups.Count ? m.Groups[n].Value : "";
+            string g; return gloss.TryGetValue(s, out g) ? g : s;
+        });
+        tpl = System.Text.RegularExpressions.Regex.Replace(tpl, @"\{(\d+)\}", delegate(System.Text.RegularExpressions.Match c)
+        {
+            int n = int.Parse(c.Groups[1].Value); return m != null && n < m.Groups.Count ? m.Groups[n].Value : "";
+        });
+        return tpl;
+    }
+
+    // null — правил для этого имени нет (и нет запасного варианта)
+    public string Describe(string name)
+    {
+        string orig = name.ToUpperInvariant(), n = orig, tag = null, d;
+        if (exact.TryGetValue(orig, out d)) return d;
+        foreach (var t in tags) if (n.EndsWith(t.Key) && n.Length > t.Key.Length) { n = n.Substring(0, n.Length - t.Key.Length); tag = t.Value; }
+        string res;
+        if (exact.TryGetValue(n, out res)) return tag != null ? res + " (" + tag + ")" : res;
+        string rest = n; bool pre = false;
+        foreach (string p in strip) if (rest.StartsWith(p)) { rest = rest.Substring(p.Length); pre = true; break; }
+        string ent = null;
+        if (pre || strip.Count == 0)
+            foreach (var e in entities)
+                if (rest == e.Key || rest.StartsWith(e.Key + "_") || System.Text.RegularExpressions.Regex.IsMatch(rest, "^" + System.Text.RegularExpressions.Regex.Escape(e.Key) + @"\d"))
+                { ent = e.Value; rest = rest.Substring(e.Key.Length).TrimStart('_'); break; }
+        string topic = null;
+        foreach (var r in (pre || strip.Count == 0 ? rules : otherRules))
+        {
+            var m = r.Key.Match(rest);
+            if (m.Success) { topic = Expand(r.Value, m); break; }
+        }
+        if (topic == null)
+        {
+            string fb = pre ? fbPrefixed : fbOther;
+            if (fb.Length == 0) return null;
+            topic = fb.Replace("{rest}", rest);
+        }
+        if (pre) foreach (var x in extras) { var m = x.Key.Match(rest); if (m.Success) topic += Expand(x.Value, m); }
+        res = topic + (ent != null ? " — " + ent : "");
+        return tag != null ? res + " (" + tag + ")" : res;
+    }
+}
+
+// ----- чтение файлов CSV / XLSX -----
+static class FileImport
+{
+    public static List<string[]> Read(string path)
+    {
+        string ext = Path.GetExtension(path).ToLower();
+        return ext == ".xlsx" || ext == ".xlsm" ? ReadXlsx(path) : ReadCsv(path);
+    }
+
+    static string DecodeText(byte[] b)
+    {
+        if (b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) return Encoding.UTF8.GetString(b, 3, b.Length - 3);
+        if (b.Length >= 2 && b[0] == 0xFF && b[1] == 0xFE) return Encoding.Unicode.GetString(b, 2, b.Length - 2);
+        if (b.Length >= 2 && b[0] == 0xFE && b[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(b, 2, b.Length - 2);
+        try { return new UTF8Encoding(false, true).GetString(b); }
+        catch { return Encoding.GetEncoding(1251).GetString(b); }
+    }
+
+    public static List<string[]> ReadCsv(string path)
+    {
+        string text = DecodeText(File.ReadAllBytes(path));
+        int nl = text.IndexOf('\n'); string first = nl < 0 ? text : text.Substring(0, nl);
+        char d = ';'; int best = -1;
+        foreach (char c in new[] { ';', '\t', ',' }) { int k = first.Split(c).Length; if (k > best) { best = k; d = c; } }
+        var rows = new List<string[]>(); var cells = new List<string>(); var sb = new StringBuilder(); bool q = false;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char ch = text[i];
+            if (q)
+            {
+                if (ch == '"') { if (i + 1 < text.Length && text[i + 1] == '"') { sb.Append('"'); i++; } else q = false; }
+                else sb.Append(ch);
+            }
+            else if (ch == '"') q = true;
+            else if (ch == d) { cells.Add(sb.ToString()); sb.Length = 0; }
+            else if (ch == '\r') { }
+            else if (ch == '\n') { cells.Add(sb.ToString()); sb.Length = 0; if (cells.Count > 1 || cells[0].Length > 0) rows.Add(cells.ToArray()); cells = new List<string>(); }
+            else sb.Append(ch);
+        }
+        if (sb.Length > 0 || cells.Count > 0) { cells.Add(sb.ToString()); rows.Add(cells.ToArray()); }
+        return rows;
+    }
+
+    // XLSX = zip с XML; читаем без сторонних библиотек (System.IO.Packaging входит в .NET Framework 4)
+    public static List<string[]> ReadXlsx(string path)
+    {
+        var rows = new List<string[]>();
+        // читаем копию: исходный файл может быть открыт в Excel, а Package.Open допускает только FileShare.Read/None
+        string tmp = Path.Combine(Path.GetTempPath(), "lc_" + Guid.NewGuid().ToString("N") + ".xlsx");
+        using (var src = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) using (var dst = new FileStream(tmp, FileMode.Create, FileAccess.Write)) src.CopyTo(dst);
+        try
+        {
+        using (var pkg = System.IO.Packaging.Package.Open(tmp, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            var shared = new List<string>(); string sheetPath = null; var sheets = new List<string>();
+            foreach (var part in pkg.GetParts())
+            {
+                string u = part.Uri.ToString();
+                if (u.Equals("/xl/sharedStrings.xml", StringComparison.OrdinalIgnoreCase))
+                    using (var s = part.GetStream()) foreach (var si in XDocument.Load(s).Descendants(ns + "si")) { var sbb = new StringBuilder(); foreach (var t in si.Descendants(ns + "t")) sbb.Append(t.Value); shared.Add(sbb.ToString()); }
+                else if (u.StartsWith("/xl/worksheets/", StringComparison.OrdinalIgnoreCase) && u.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) sheets.Add(u);
+            }
+            sheets.Sort(); if (sheets.Count == 0) return rows; sheetPath = sheets[0];
+            using (var s = pkg.GetPart(new Uri(sheetPath, UriKind.Relative)).GetStream())
+                foreach (var row in XDocument.Load(s).Descendants(ns + "row"))
+                {
+                    var cells = new Dictionary<int, string>(); int max = -1;
+                    foreach (var c in row.Elements(ns + "c"))
+                    {
+                        string r = (string)c.Attribute("r") ?? ""; int col = 0, i = 0;
+                        while (i < r.Length && char.IsLetter(r[i])) { col = col * 26 + (char.ToUpper(r[i]) - 'A' + 1); i++; }
+                        col--; if (col < 0) col = cells.Count;
+                        string t = (string)c.Attribute("t"), val = "";
+                        if (t == "s") { var v = c.Element(ns + "v"); int idx; if (v != null && int.TryParse(v.Value, out idx) && idx < shared.Count) val = shared[idx]; }
+                        else if (t == "inlineStr") { var sbb = new StringBuilder(); foreach (var x in c.Descendants(ns + "t")) sbb.Append(x.Value); val = sbb.ToString(); }
+                        else { var v = c.Element(ns + "v"); val = v != null ? v.Value : ""; }
+                        cells[col] = val; if (col > max) max = col;
+                    }
+                    if (max < 0) continue;
+                    var arr = new string[max + 1]; for (int k = 0; k <= max; k++) { string v; arr[k] = cells.TryGetValue(k, out v) ? v : ""; }
+                    rows.Add(arr);
+                }
+        }
+        }
+        finally { try { File.Delete(tmp); } catch { } }
+        return rows;
+    }
+}
+
+// ----- хранение ключа API (шифрование Windows DPAPI: расшифровать может только этот пользователь Windows) -----
+static class Secret
+{
+    public static string Protect(string plain)
+    {
+        if (string.IsNullOrEmpty(plain)) return "";
+        try { return "dpapi:" + Convert.ToBase64String(System.Security.Cryptography.ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), null, System.Security.Cryptography.DataProtectionScope.CurrentUser)); }
+        catch { return ""; }
+    }
+    public static string Unprotect(string stored)
+    {
+        if (string.IsNullOrEmpty(stored) || !stored.StartsWith("dpapi:")) return "";
+        try { return Encoding.UTF8.GetString(System.Security.Cryptography.ProtectedData.Unprotect(Convert.FromBase64String(stored.Substring(6)), null, System.Security.Cryptography.DataProtectionScope.CurrentUser)); }
+        catch { return ""; }
+    }
+}
+
+// ----- клиент OpenAI-совместимого сервиса (OpenAI, Azure-совместимые шлюзы, Ollama, LM Studio, vLLM и т. п.) -----
+static class Ai
+{
+    static string Endpoint()
+    {
+        string u = Cfg.AiUrl.Trim().TrimEnd('/');
+        return u.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) ? u : u + "/chat/completions";
+    }
+
+    // возвращает текст ответа модели; бросает исключение с понятным сообщением
+    public static string Chat(string system, string user, CancellationToken ct)
+    {
+        if (Cfg.AiUrl.Trim().Length == 0) throw new Exception("Не задан адрес сервиса ИИ (Настройки → Описания и ИИ).");
+        if (Cfg.AiModel.Trim().Length == 0) throw new Exception("Не задана модель (Настройки → Описания и ИИ).");
+        try { System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)(3072 | 768 | 192); } catch { }
+        System.Net.ServicePointManager.Expect100Continue = false;
+        var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+        var body = new Dictionary<string, object>();
+        body["model"] = Cfg.AiModel.Trim(); body["temperature"] = 0.2;
+        body["messages"] = new object[] {
+            new Dictionary<string, object> { { "role", "system" }, { "content", system } },
+            new Dictionary<string, object> { { "role", "user" }, { "content", user } } };
+        byte[] data = Encoding.UTF8.GetBytes(ser.Serialize(body));
+        var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(Endpoint());
+        req.Method = "POST"; req.ContentType = "application/json; charset=utf-8"; req.Accept = "application/json";
+        req.Timeout = Cfg.AiTimeout * 1000; req.ReadWriteTimeout = Cfg.AiTimeout * 1000; req.UserAgent = "LoginChanger";
+        if (Cfg.AiKey.Length > 0) req.Headers["Authorization"] = "Bearer " + Cfg.AiKey;
+        string resp;
+        try
+        {
+            using (var s = req.GetRequestStream()) s.Write(data, 0, data.Length);
+            ct.Register(delegate { try { req.Abort(); } catch { } });
+            using (var r = (System.Net.HttpWebResponse)req.GetResponse()) using (var sr = new StreamReader(r.GetResponseStream(), Encoding.UTF8)) resp = sr.ReadToEnd();
+        }
+        catch (System.Net.WebException ex)
+        {
+            if (ct.IsCancellationRequested) throw new OperationCanceledException();
+            string detail = ex.Message;
+            if (ex.Response != null)
+                try
+                {
+                    var hr = (System.Net.HttpWebResponse)ex.Response;
+                    using (var sr = new StreamReader(hr.GetResponseStream(), Encoding.UTF8)) { string t = sr.ReadToEnd(); detail = (int)hr.StatusCode + " " + hr.StatusDescription + ": " + (t.Length > 400 ? t.Substring(0, 400) : t); }
+                }
+                catch { }
+            throw new Exception("Сервис ИИ вернул ошибку: " + detail);
+        }
+        var root = ser.DeserializeObject(resp) as Dictionary<string, object>;
+        if (root == null || !root.ContainsKey("choices")) throw new Exception("Неожиданный ответ сервиса ИИ: " + (resp.Length > 300 ? resp.Substring(0, 300) : resp));
+        var choices = root["choices"] as object[];
+        if (choices == null || choices.Length == 0) throw new Exception("Сервис ИИ вернул пустой ответ.");
+        var msg = ((Dictionary<string, object>)choices[0])["message"] as Dictionary<string, object>;
+        return msg != null && msg.ContainsKey("content") ? Convert.ToString(msg["content"]) : "";
+    }
+
+    // из ответа модели достаём {"имя": "описание"} (допускаем обрамление ```json и пояснения вокруг)
+    public static Dictionary<string, string> ParseDescriptions(string content)
+    {
+        var res = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        int a = content.IndexOf('{'), b = content.LastIndexOf('}');
+        if (a < 0 || b <= a) return res;
+        var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+        var root = ser.DeserializeObject(content.Substring(a, b - a + 1)) as Dictionary<string, object>;
+        if (root == null) return res;
+        object inner;
+        var map = root.TryGetValue("descriptions", out inner) ? inner as Dictionary<string, object> : root;
+        if (map == null) { var arr = inner as object[]; if (arr != null) foreach (object o in arr) { var d = o as Dictionary<string, object>; if (d != null && d.ContainsKey("name")) res[Convert.ToString(d["name"])] = d.ContainsKey("description") ? Convert.ToString(d["description"]) : ""; } return res; }
+        foreach (var kv in map) if (kv.Value is string) res[kv.Key] = (string)kv.Value;
+        return res;
+    }
+}
+
+// описания, которые нельзя хранить в самой СУБД (представления MySQL): файл рядом с программой
+static class Sidecar
+{
+    static string FileFor(Db db)
+    {
+        string n = db.Kind + "_" + db.Server + "_" + db.Name; foreach (char c in Path.GetInvalidFileNameChars()) n = n.Replace(c, '_');
+        return Path.Combine(Path.Combine(App.Dir, "descriptions"), n + ".tsv");
+    }
+    public static Dictionary<string, string> Load(Db db)
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try { string f = FileFor(db); if (File.Exists(f)) foreach (string l in File.ReadAllLines(f, Encoding.UTF8)) { int i = l.IndexOf('\t'); if (i > 0) d[l.Substring(0, i)] = l.Substring(i + 1); } } catch { }
+        return d;
+    }
+    public static void Set(Db db, string nm, string text)
+    {
+        var d = Load(db);
+        if (text.Length == 0) d.Remove(nm); else d[nm] = text.Replace("\t", " ").Replace("\r", " ").Replace("\n", " ");
+        string f = FileFor(db); Directory.CreateDirectory(Path.GetDirectoryName(f));
+        var sb = new StringBuilder(); foreach (var kv in d) sb.AppendLine(kv.Key + "\t" + kv.Value);
+        File.WriteAllText(f, sb.ToString(), new UTF8Encoding(false));
+    }
+}
+// ===== вкладка «Описания» =====
+class DescriptionsTab : Panel
+{
+    Db db; DataGridView g = new DataGridView();
+    List<DescItem> items = new List<DescItem>(); DataTable objTable;
+    HintBox tf = new HintBox(); FlatCombo cType = new FlatCombo(), cStat = new FlatCombo(), cMode = new FlatCombo();
+    Label lInfo = new Label();
+    Button bWrite, bAi, bCancel, bUndo;
+    public bool Stale = true; public event Action Changed;
+    bool loading; CancellationTokenSource aiCts; bool aiBusy; static bool aiConsent;
+    string aiMessage = "";
+    class Hist { public string Title; public List<DescItem> Items = new List<DescItem>(); public List<string> OldText = new List<string>(), OldStored = new List<string>(); }
+    List<Hist> hist = new List<Hist>();
+    static readonly string[] AllTypes = { "V", "U", "P", "PC", "FN", "IF", "TF", "FS", "FT", "AF" };
+    public List<DescItem> Items { get { return items; } }
+    public bool AiBusy { get { return aiBusy; } }
+    public string AiMessage { get { return aiMessage; } }
+
+    public DescriptionsTab(Db db)
+    {
+        this.db = db;
+        g.Dock = DockStyle.Fill; g.AllowUserToAddRows = false; g.AllowUserToDeleteRows = false; g.AllowUserToResizeRows = false;
+        g.BackgroundColor = SystemColors.Window; g.RowHeadersVisible = false; g.MultiSelect = true; g.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        g.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2; g.ColumnHeadersHeight = 34;
+        g.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+        g.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Объект", Width = 260, ReadOnly = true });
+        g.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Тип", Width = 130, ReadOnly = true });
+        g.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Сейчас в базе", Width = 330, ReadOnly = true, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 45, MinimumWidth = 160 });
+        g.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Новое описание (двойной клик или F2)", Width = 430, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 55, MinimumWidth = 220 });
+        g.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Источник", Width = 190, ReadOnly = true });
+        foreach (DataGridViewColumn c in g.Columns) c.DefaultCellStyle.WrapMode = DataGridViewTriState.False;
+        g.CellEndEdit += CellEdited;
+        g.DataError += delegate { };
+
+        var filters = FlowRow(); filters.Dock = DockStyle.Top; filters.Padding = new Padding(0, 4, 0, 2);
+        tf.Width = 280; tf.Margin = new Padding(0, 4, 8, 3); tf.Hint = "Поиск по объектам и описаниям…"; tf.TextChanged += delegate { ApplyFilter(); };
+        cType.Items.AddRange(new object[] { "Все типы", "Представления", "Таблицы", "Процедуры", "Функции" }); cType.SelectedIndex = 0; cType.Width = 150; cType.Margin = new Padding(0, 3, 8, 3);
+        cStat.Items.AddRange(new object[] { "Все", "Без описания", "С описанием", "Изменённые", "ИИ: не проверено", "Хранятся локально" }); cStat.SelectedIndex = 0; cStat.Width = 180; cStat.Margin = new Padding(0, 3, 24, 3);
+        cType.SelectedIndexChanged += delegate { ApplyFilter(); }; cStat.SelectedIndexChanged += delegate { ApplyFilter(); };
+        var lm = new Label { Text = "Заполнять:", AutoSize = true, Margin = new Padding(0, 9, 6, 3) };
+        cMode.Items.AddRange(new object[] { "только пустые", "перезаписывать" }); cMode.SelectedIndex = 0; cMode.Width = 160; cMode.Margin = new Padding(0, 3, 8, 3);
+        filters.Controls.Add(tf); filters.Controls.Add(cType); filters.Controls.Add(cStat); filters.Controls.Add(lm); filters.Controls.Add(cMode);
+
+        var actions = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(0, 2, 0, 6) };
+        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); actions.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var left = FlowRow(); left.Dock = DockStyle.Fill; var right = FlowRow(); right.WrapContents = false; right.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        bWrite = AddBtn(left, "Записать в базу", delegate { Write(); }, "primary");
+        AddBtn(left, "Сбросить", delegate { DropDrafts(); }, "ghost");
+        bUndo = AddBtn(left, "Откатить последнее", delegate { Undo(); }, "ghost");
+        AddBtn(left, "Из файла…", delegate { ImportDialog(); }, "ghost");
+        AddBtn(left, "По правилам…", delegate { RulesDialog(); }, "ghost");
+        bAi = AddBtn(left, "Предложить ИИ…", delegate { StartAi(Targets()); }, "ghost");
+        bCancel = AddBtn(left, "Остановить ИИ", delegate { if (aiCts != null) aiCts.Cancel(); }, "ghost"); bCancel.Visible = false;
+        AddBtn(left, "Отметить проверенными", delegate { MarkReviewed(Targets()); }, "ghost");
+        AddBtn(right, "Экспорт CSV", delegate { ExportCsvDialog(); }, "ghost");
+        AddBtn(right, "SQL-скрипт…", delegate { ExportSqlDialog(); }, "ghost");
+        AddBtn(right, "Обновить", delegate { Reload(true); }, "ghost").Margin = new Padding(0, 3, 0, 3);
+        actions.Controls.Add(left, 0, 0); actions.Controls.Add(right, 1, 0);
+
+        lInfo.Tag = "muted"; lInfo.AutoSize = true; lInfo.Dock = DockStyle.Top; lInfo.Margin = new Padding(0, 6, 3, 8); lInfo.Padding = new Padding(0, 0, 0, 8);
+        var hint = new Label { Text = "Правьте описание в колонке «Новое» (или выделите строки и заполните из файла, по правилам или с помощью ИИ). Ничего не пишется в базу, пока вы не нажмёте «Записать в базу»; можно откатить.", AutoSize = true, Tag = "muted", Dock = DockStyle.Top, Padding = new Padding(0, 0, 0, 6) };
+        SizeChanged += delegate { lInfo.MaximumSize = hint.MaximumSize = new Size(Math.Max(300, ClientSize.Width - 8), 0); };
+        Controls.Add(g); Controls.Add(hint); Controls.Add(lInfo); Controls.Add(actions); Controls.Add(filters);
+    }
+
+    static FlowLayoutPanel FlowRow() { return new FlowLayoutPanel { AutoSize = true, WrapContents = true, Margin = new Padding(0), Padding = new Padding(0) }; }
+    static Button AddBtn(Control p, string t, EventHandler h, string tag)
+    {
+        var b = new Button { Text = t, AutoSize = true, Tag = tag, Margin = new Padding(0, 3, 8, 3) }; b.Click += h; p.Controls.Add(b); return b;
+    }
+
+    // ---------- загрузка ----------
+    public void Reload(bool ask)
+    {
+        if (ask && DirtyCount() > 0 && !UI.Ask("Есть неприменённые изменения (" + DirtyCount() + "). Отбросить?")) return;
+        try
+        {
+            Cursor = Cursors.WaitCursor; loading = true;
+            objTable = db.D.Objects(AllTypes);
+            bool hasSrc = objTable.Columns.Contains("src"), hasDescr = objTable.Columns.Contains("descr");
+            items.Clear();
+            foreach (DataRow r in objTable.Rows)
+            {
+                var it = new DescItem { Oid = Convert.ToInt32(r["oid"]), Sch = Convert.ToString(r["sch"]), Nm = Convert.ToString(r["nm"]), Tp = Convert.ToString(r["tp"]) };
+                it.Cur = hasDescr ? Convert.ToString(r["descr"]).Trim() : "";
+                it.CurStored = hasSrc ? Convert.ToString(r["src"]).Trim() : "";
+                it.CurSrc = DescItem.SrcCode(it.CurStored); it.Local = db.D.DescLocal(it.Tp);
+                items.Add(it);
+            }
+            Rebuild(); Stale = false;
+        }
+        catch (Exception ex) { App.Log("Ошибка загрузки описаний: " + ex.Message); UI.Warn(ex.Message); }
+        finally { loading = false; Cursor = Cursors.Default; }
+    }
+
+    int DirtyCount() { int n = 0; foreach (var it in items) if (it.Dirty) n++; return n; }
+
+    void Rebuild()
+    {
+        g.CurrentCell = null; g.Rows.Clear();
+        foreach (var it in items) { int i = g.Rows.Add(it.Full, DescItem.Kind(it.Tp) + (it.Local ? " (локально)" : ""), it.Cur, it.New ?? "", ""); g.Rows[i].Tag = it; PaintRow(g.Rows[i]); }
+        g.ClearSelection(); ApplyFilter();
+    }
+
+    static Color AiColor { get { return Theme.Dark ? Color.FromArgb(70, 55, 110) : Color.FromArgb(232, 222, 255); } }
+
+    void PaintRow(DataGridViewRow r)
+    {
+        var it = (DescItem)r.Tag;
+        r.Cells[2].Value = it.Cur; r.Cells[3].Value = it.New ?? ""; r.Cells[4].Value = DescItem.SrcName(it.ShownSrc);
+        r.Cells[0].Style.BackColor = it.Shown.Length == 0 ? Theme.NoneRow : Color.Empty;
+        r.Cells[3].Style.BackColor = it.Dirty ? Theme.Pending : Color.Empty;
+        r.Cells[4].Style.BackColor = it.ShownSrc == "ai?" ? AiColor : Color.Empty;
+        r.Cells[2].ToolTipText = it.Cur; r.Cells[3].ToolTipText = it.New ?? "";
+    }
+
+    void CellEdited(object s, DataGridViewCellEventArgs e)
+    {
+        if (loading || e.RowIndex < 0 || e.ColumnIndex != 3) return;
+        var r = g.Rows[e.RowIndex]; var it = (DescItem)r.Tag;
+        string v = Convert.ToString(r.Cells[3].Value ?? "").Trim();
+        if (v == it.Cur && v.Length > 0) { it.New = null; it.NewSrc = ""; it.NewDetail = ""; }
+        else if (v.Length == 0 && it.Cur.Length == 0) { it.New = null; it.NewSrc = ""; it.NewDetail = ""; }
+        else { it.New = v; it.NewSrc = "manual"; it.NewDetail = ""; }
+        PaintRow(r); UpdateInfo();
+    }
+
+    // ---------- фильтры ----------
+    public void ApplyFilter()
+    {
+        if (g.Rows.Count == 0) { UpdateInfo(); return; }
+        var words = tf.Text.ToLower().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        int ty = cType.SelectedIndex, st = cStat.SelectedIndex;
+        g.CurrentCell = null;
+        foreach (DataGridViewRow r in g.Rows)
+        {
+            var it = (DescItem)r.Tag; bool ok = true;
+            string hay = (it.Full + " " + it.Shown).ToLower();
+            foreach (string w in words) if (hay.IndexOf(w) < 0) { ok = false; break; }
+            if (ok && ty > 0) ok = ty == 1 ? it.Tp == "V" : ty == 2 ? it.Tp == "U" : ty == 3 ? (it.Tp == "P" || it.Tp == "PC") : (it.Tp != "V" && it.Tp != "U" && it.Tp != "P" && it.Tp != "PC");
+            if (ok && st > 0) ok = st == 1 ? it.Shown.Length == 0 : st == 2 ? it.Shown.Length > 0 : st == 3 ? it.Dirty : st == 4 ? it.ShownSrc == "ai?" : it.Local;
+            r.Visible = ok;
+        }
+        UpdateInfo();
+    }
+
+    void UpdateInfo()
+    {
+        int vis = 0, none = 0, dirty = 0, ai = 0;
+        foreach (DataGridViewRow r in g.Rows) if (r.Visible) vis++;
+        foreach (var it in items) { if (it.Shown.Length == 0) none++; if (it.Dirty) dirty++; if (it.ShownSrc == "ai?") ai++; }
+        lInfo.Text = "Показано " + vis + " из " + items.Count + "  ·  без описания: " + none + "  ·  изменений к записи: " + dirty + (ai > 0 ? "  ·  ИИ, не проверено: " + ai : "") + (aiMessage.Length > 0 ? "  ·  " + aiMessage : "");
+        if (bWrite != null) bWrite.Text = dirty > 0 ? "Записать в базу (" + dirty + ")" : "Записать в базу";
+    }
+
+    // с чем работают «из файла / по правилам / ИИ»: выделенные строки, а если ничего не выделено — все видимые
+    public List<DescItem> Targets()
+    {
+        var l = new List<DescItem>();
+        foreach (DataGridViewRow r in g.SelectedRows) if (r.Visible) l.Add((DescItem)r.Tag);
+        if (l.Count >= 2) return l;
+        foreach (DataGridViewRow r in g.Rows) if (r.Visible) l.Add((DescItem)r.Tag);
+        return l;
+    }
+
+    bool OnlyEmpty { get { return cMode.SelectedIndex == 0; } }
+    public void SetMode(bool onlyEmpty) { cMode.SelectedIndex = onlyEmpty ? 0 : 1; }
+    public void SetTypeFilter(int i) { cType.SelectedIndex = i; }
+
+    // кладёт черновик, учитывая режим «только пустые»
+    bool Put(DescItem it, string text, string src, string detail)
+    {
+        text = (text ?? "").Trim();
+        if (text.Length == 0) return false;
+        if (OnlyEmpty && it.Shown.Length > 0) return false;
+        if (text == it.Cur && src == it.CurSrc) return false;
+        if (text == it.Cur) { it.New = null; it.NewSrc = ""; it.NewDetail = ""; return false; }
+        it.New = text; it.NewSrc = src; it.NewDetail = detail ?? ""; return true;
+    }
+
+    void RefreshAll() { foreach (DataGridViewRow r in g.Rows) PaintRow(r); ApplyFilter(); }
+
+    public void DropDrafts()
+    {
+        foreach (var it in items) { it.New = null; it.NewSrc = ""; it.NewDetail = ""; }
+        RefreshAll();
+    }
+
+    // ---------- из файла ----------
+    static string Norm(string s)
+    {
+        s = (s ?? "").Trim().Replace("[", "").Replace("]", "").Replace("\"", "").Replace("`", "");
+        return s.ToLower();
+    }
+    Dictionary<string, DescItem> Index(List<DescItem> src)
+    {
+        var d = new Dictionary<string, DescItem>();
+        foreach (var it in src) { string f = Norm(it.Full), n = Norm(it.Nm); if (!d.ContainsKey(f)) d[f] = it; if (!d.ContainsKey(n)) d[n] = it; }
+        return d;
+    }
+
+    void ImportDialog()
+    {
+        using (var d = new OpenFileDialog())
+        {
+            d.Filter = "Таблицы (*.xlsx;*.csv;*.txt)|*.xlsx;*.csv;*.txt|Все файлы|*.*"; d.Title = "Файл с описаниями: объект и описание";
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try { string rep; ImportFrom(d.FileName, Targets(), out rep); UI.Info(rep); }
+            catch (Exception ex) { App.Log("ОШИБКА импорта: " + ex.Message); UI.Warn("Не удалось прочитать файл:\n" + ex.Message); }
+        }
+    }
+
+    // два первых столбца: имя объекта и описание. Возвращает число применённых
+    public int ImportFrom(string path, List<DescItem> targets, out string report)
+    {
+        var rows = FileImport.Read(path);
+        var idx = Index(targets); var all = Index(items);
+        int ok = 0, same = 0, skipped = 0, unk = 0, total = 0; var miss = new List<string>();
+        for (int i = 0; i < rows.Count; i++)
+        {
+            var r = rows[i]; if (r.Length < 2) continue;
+            string name = r[0].Trim(), text = r[1].Trim(); if (name.Length == 0) continue;
+            DescItem it;
+            if (i == 0 && !all.ContainsKey(Norm(name))) continue;       // строка заголовка
+            total++;
+            if (!all.TryGetValue(Norm(name), out it)) { unk++; if (miss.Count < 8) miss.Add(name); continue; }
+            if (!idx.ContainsKey(Norm(name))) { skipped++; continue; }   // объект вне выбранного набора
+            if (text.Length == 0) continue;
+            if (Put(it, text, "file", Path.GetFileName(path))) ok++; else if (it.Shown == text) same++; else skipped++;
+        }
+        RefreshAll();
+        report = "Файл: " + Path.GetFileName(path) + "\nСтрок с данными: " + total + "\nПрименено к черновику: " + ok + "\nУже совпадает: " + same + "\nПропущено (есть описание в режиме «только пустые» или вне выбора): " + skipped +
+                 "\nНе найдено в базе: " + unk + (miss.Count > 0 ? " (например: " + string.Join(", ", miss.ToArray()) + ")" : "") + "\n\nПроверьте колонку «Новое описание» и нажмите «Записать в базу».";
+        App.Log("Импорт описаний из файла: " + Path.GetFileName(path) + ", применено " + ok);
+        return ok;
+    }
+
+    // ---------- по правилам ----------
+    void RulesDialog()
+    {
+        using (var d = new OpenFileDialog())
+        {
+            d.Filter = "Файлы правил (*.rules;*.txt)|*.rules;*.txt|Все файлы|*.*"; d.Title = "Файл правил описаний";
+            if (Cfg.RulesFile.Length > 0 && File.Exists(Cfg.RulesFile)) { d.InitialDirectory = Path.GetDirectoryName(Cfg.RulesFile); d.FileName = Path.GetFileName(Cfg.RulesFile); }
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try { Cfg.RulesFile = d.FileName; Cfg.Save(); string rep; ApplyRules(RuleSet.Load(d.FileName), Targets(), d.FileName, out rep); UI.Info(rep); }
+            catch (Exception ex) { App.Log("ОШИБКА правил: " + ex.Message); UI.Warn("Не удалось применить правила:\n" + ex.Message); }
+        }
+    }
+
+    public int ApplyRules(RuleSet rs, List<DescItem> targets, string file, out string report)
+    {
+        int ok = 0, none = 0, skipped = 0;
+        foreach (var it in targets)
+        {
+            string t = rs.Describe(it.Nm);
+            if (t == null) { none++; continue; }
+            if (Put(it, t, "rules", Path.GetFileName(file))) ok++; else skipped++;
+        }
+        RefreshAll();
+        report = "Правила: " + Path.GetFileName(file) + "\nОбъектов: " + targets.Count + "\nОписаний предложено: " + ok + "\nПропущено (уже есть описание или совпадает): " + skipped + "\nНет подходящего правила: " + none +
+                 "\n\nПроверьте колонку «Новое описание» и нажмите «Записать в базу».";
+        App.Log("Описания по правилам: " + Path.GetFileName(file) + ", предложено " + ok);
+        return ok;
+    }
+
+    // ---------- ИИ ----------
+    static readonly string AiSystem = "Ты помогаешь администратору базы данных документировать объекты (представления, таблицы, процедуры, функции) так, чтобы их понимали сотрудники, не знающие SQL. " +
+        "Отвечай только JSON без пояснений. Не выдумывай того, чего нельзя понять из названия, столбцов и определения.";
+
+    // собирает запросы (на потоке интерфейса), отправляет в фоне, результаты складывает в черновик
+    public void StartAi(List<DescItem> targets)
+    {
+        if (aiBusy) return;
+        var list = new List<DescItem>();
+        foreach (var it in targets) if (!OnlyEmpty || it.Shown.Length == 0) list.Add(it);
+        if (list.Count == 0) { UI.Info("Нет объектов для ИИ: в режиме «только пустые» у выбранных уже есть описания."); return; }
+        if (Cfg.AiUrl.Trim().Length == 0 || Cfg.AiModel.Trim().Length == 0)
+        { UI.Warn("Сначала настройте ИИ: Настройки → «Описания и ИИ» (адрес сервиса, модель, при необходимости ключ)."); return; }
+        bool local = false;
+        try { var u = new Uri(Cfg.AiUrl.Trim()); local = u.IsLoopback; } catch { }
+        if (!local && !aiConsent)
+        {
+            string host = Cfg.AiUrl; try { host = new Uri(Cfg.AiUrl.Trim()).Host; } catch { }
+            if (!UI.Ask("Будут отправлены на «" + host + "» (модель " + Cfg.AiModel + "):\n  • имена и столбцы " + list.Count + " объектов" + (Cfg.AiSendDef ? "\n  • тексты определений (SQL) представлений и процедур" : "") +
+                "\n  • ваш глоссарий и примеры существующих описаний\n\nДанные из таблиц не отправляются.\nПродолжить?")) return;
+            aiConsent = true;
+        }
+        DataTable meta;
+        try { meta = db.D.Meta(objTable, Cfg.AiSendDef ? Cfg.AiMaxDef : 0); }
+        catch (Exception ex) { UI.Warn("Не удалось прочитать структуру объектов:\n" + ex.Message); return; }
+        var cols = new Dictionary<int, string>(); var defs = new Dictionary<int, string>();
+        foreach (DataRow r in meta.Rows) { int o = Convert.ToInt32(r["oid"]); cols[o] = Convert.ToString(r["cols"]); defs[o] = Convert.ToString(r["def"]); }
+        var gl = new StringBuilder();
+        if (Cfg.RulesFile.Length > 0 && File.Exists(Cfg.RulesFile))
+            try { int n = 0; foreach (var kv in RuleSet.Load(Cfg.RulesFile).Glossary) { gl.AppendLine("- " + kv.Key + " = " + kv.Value); if (++n >= 60) break; } } catch { }
+        var prompts = new List<string>(); var names = new List<List<DescItem>>();
+        int batch = Math.Max(1, Cfg.AiBatch), maxLen = Cfg.AiMaxLen;
+        for (int i = 0; i < list.Count; i += batch)
+        {
+            var part = list.GetRange(i, Math.Min(batch, list.Count - i));
+            var sb = new StringBuilder();
+            sb.AppendLine("Для каждого объекта базы данных (" + db.D.Title + ") напиши краткое описание на русском.");
+            sb.AppendLine("Стиль: " + Cfg.AiStyle.Replace("{max}", maxLen.ToString()));
+            if (gl.Length > 0) { sb.AppendLine("Глоссарий сокращений:"); sb.Append(gl.ToString()); }
+            var ex = Examples(part[0], 6);
+            if (ex.Count > 0) { sb.AppendLine("Примеры уже принятых описаний:"); foreach (var e in ex) sb.AppendLine("- " + e.Nm + ": " + e.Cur); }
+            sb.AppendLine("Объекты:");
+            foreach (var it in part)
+            {
+                string c, d; cols.TryGetValue(it.Oid, out c); defs.TryGetValue(it.Oid, out d);
+                sb.AppendLine("### " + it.Nm + " (" + DescItem.Kind(it.Tp) + ")");
+                if (!string.IsNullOrEmpty(c)) sb.AppendLine("Столбцы: " + c);
+                if (Cfg.AiSendDef && !string.IsNullOrEmpty(d)) sb.AppendLine("Определение: " + d.Replace("\r", " ").Replace("\n", " "));
+            }
+            sb.AppendLine("Ответь строго JSON: {\"descriptions\": {\"ИМЯ\": \"описание\", ...}}. Ключи — точно как в заголовках ###. Описание не длиннее " + maxLen + " символов.");
+            prompts.Add(sb.ToString()); names.Add(part);
+        }
+        var cts = new CancellationTokenSource(); aiCts = cts; aiBusy = true; aiMessage = "ИИ: 0 из " + list.Count;
+        bAi.Enabled = false; bCancel.Visible = true; UpdateInfo();
+        string model = Cfg.AiModel.Trim();
+        var th = new Thread(delegate()
+        {
+            int done = 0; string err = null;
+            try
+            {
+                for (int b = 0; b < prompts.Count; b++)
+                {
+                    cts.Token.ThrowIfCancellationRequested();
+                    string content = Ai.Chat(AiSystem, prompts[b], cts.Token);
+                    var res = Ai.ParseDescriptions(content); var part = names[b]; done += part.Count; int cd = done;
+                    InvokeSafe(delegate
+                    {
+                        int applied = 0;
+                        foreach (var it in part)
+                        {
+                            string t; if (!res.TryGetValue(it.Nm, out t) && !res.TryGetValue(it.Full, out t)) continue;
+                            t = t.Trim(); if (t.Length > maxLen) t = t.Substring(0, maxLen).TrimEnd() + "…";
+                            if (Put(it, t, "ai?", model)) applied++;
+                        }
+                        aiMessage = "ИИ: " + cd + " из " + list.Count; RefreshAll();
+                    });
+                }
+            }
+            catch (OperationCanceledException) { err = "остановлено"; }
+            catch (Exception ex) { err = ex.Message; }
+            InvokeSafe(delegate
+            {
+                aiBusy = false; aiCts = null; bAi.Enabled = true; bCancel.Visible = false;
+                aiMessage = err == null ? "ИИ: готово (" + list.Count + ")" : "ИИ: " + err;
+                UpdateInfo();
+                App.Log("ИИ-описания: " + aiMessage);
+                if (err != null && err != "остановлено") UI.Warn(err);
+            });
+        });
+        th.IsBackground = true; th.Start();
+    }
+
+    void InvokeSafe(Action a) { try { if (IsHandleCreated) BeginInvoke(a); else a(); } catch { } }
+
+    // примеры: описания соседей с похожим именем (общий префикс)
+    List<DescItem> Examples(DescItem like, int n)
+    {
+        var l = new List<DescItem>();
+        foreach (var it in items) if (it != like && it.Cur.Length > 0) l.Add(it);
+        string key = like.Nm.ToUpperInvariant();
+        l.Sort(delegate(DescItem a, DescItem b) { return Common(b.Nm.ToUpperInvariant(), key) - Common(a.Nm.ToUpperInvariant(), key); });
+        return l.Count > n ? l.GetRange(0, n) : l;
+    }
+    static int Common(string a, string b) { int i = 0; while (i < a.Length && i < b.Length && a[i] == b[i]) i++; return i; }
+
+    public void MarkReviewed(List<DescItem> targets)
+    {
+        int n = 0;
+        foreach (var it in targets)
+            if (it.ShownSrc == "ai?") { if (it.New == null) { it.New = it.Cur; it.NewDetail = DescItem.Detail(it.CurStored); } it.NewSrc = "ai"; n++; }
+        RefreshAll();
+        if (n == 0) UI.Info("Среди выбранных нет описаний ИИ без проверки.");
+    }
+
+    // ---------- запись и откат ----------
+    static string Stored(DescItem it)
+    {
+        string d = string.IsNullOrEmpty(it.NewDetail) ? "" : it.NewDetail;
+        return it.NewSrc + "|" + d + "|" + DateTime.Now.ToString("yyyy-MM-dd");
+    }
+
+    public int Write()
+    {
+        var dirty = new List<DescItem>(); foreach (var it in items) if (it.Dirty) dirty.Add(it);
+        if (dirty.Count == 0) { UI.Info("Нет изменений для записи."); return 0; }
+        int local = 0; foreach (var it in dirty) if (it.Local) local++;
+        if (Cfg.ConfirmApply && !UI.Ask("Записать описаний: " + dirty.Count + (local > 0 ? "\n(" + local + " из них хранятся локально в файле рядом с программой, а не в базе)" : "") + "?\n" + (db.D.Transactional ? "Всё выполняется одной транзакцией." : "При ошибке уже записанные описания будут возвращены."))) return 0;
+        var h = new Hist { Title = DateTime.Now.ToString("HH:mm") + " — описаний: " + dirty.Count };
+        var done = new List<DescItem>();
+        try
+        {
+            Action run = delegate
+            {
+                foreach (var it in dirty)
+                {
+                    db.D.SetDescription(it.Sch, it.Nm, it.Tp, it.New, it.New.Length == 0 ? "" : Stored(it));
+                    h.Items.Add(it); h.OldText.Add(it.Cur); h.OldStored.Add(it.CurStored); done.Add(it);
+                }
+            };
+            if (db.D.Transactional) db.InTx(run); else run();
+        }
+        catch (Exception ex)
+        {
+            App.Log("ОШИБКА записи описаний: " + ex.Message);
+            if (!db.D.Transactional) for (int i = done.Count - 1; i >= 0; i--) { try { db.D.SetDescription(done[i].Sch, done[i].Nm, done[i].Tp, h.OldText[i], h.OldStored[i]); } catch { } }
+            UI.Warn("Ошибка при записи, изменения отменены:\n" + ex.Message); Reload(false); return 0;
+        }
+        hist.Add(h); App.Log("Записано описаний: " + dirty.Count);
+        Reload(false); if (Changed != null) Changed();
+        return dirty.Count;
+    }
+
+    public void Undo()
+    {
+        if (hist.Count == 0) { UI.Info("Откатывать нечего: в этой сессии описания не записывались."); return; }
+        var h = hist[hist.Count - 1];
+        if (DirtyCount() > 0 && !UI.Ask("Есть неприменённые изменения (" + DirtyCount() + "). Они будут отброшены. Продолжить?")) return;
+        if (Cfg.ConfirmUndo && !UI.Ask("Откатить: " + h.Title + "?")) return;
+        try
+        {
+            Action run = delegate { for (int i = 0; i < h.Items.Count; i++) db.D.SetDescription(h.Items[i].Sch, h.Items[i].Nm, h.Items[i].Tp, h.OldText[i], h.OldStored[i]); };
+            if (db.D.Transactional) db.InTx(run); else run();
+        }
+        catch (Exception ex) { App.Log("ОШИБКА отката описаний: " + ex.Message); UI.Warn("Не удалось откатить:\n" + ex.Message); return; }
+        hist.RemoveAt(hist.Count - 1); App.Log("Откат описаний: " + h.Title);
+        Reload(false); if (Changed != null) Changed();
+    }
+
+    // ---------- экспорт ----------
+    void ExportCsvDialog() { string p = Csv.Ask("descriptions"); if (p == null) return; try { UI.Info("Сохранено строк: " + ExportCsv(p) + "\n" + p); } catch (Exception ex) { UI.Warn(ex.Message); } }
+
+    // «объект; описание; тип» — второй столбец совпадает с форматом импорта, файл можно править и загрузить обратно
+    public int ExportCsv(string path)
+    {
+        var rows = new List<string[]>(); foreach (DataGridViewRow r in g.Rows) if (r.Visible) { var it = (DescItem)r.Tag; rows.Add(new[] { it.Full, it.Shown, DescItem.Kind(it.Tp) }); }
+        Csv.WriteRows(new[] { "Объект", "Описание", "Тип" }, rows, path);
+        return rows.Count;
+    }
+
+    void ExportSqlDialog()
+    {
+        using (var d = new SaveFileDialog())
+        {
+            d.Filter = "SQL-скрипт (*.sql)|*.sql"; d.FileName = "descriptions_" + DateTime.Now.ToString("yyyyMMdd_HHmm") + ".sql"; d.InitialDirectory = App.Dir;
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try { UI.Info("В скрипте описаний: " + ExportSql(d.FileName) + "\n" + d.FileName); } catch (Exception ex) { UI.Warn(ex.Message); }
+        }
+    }
+
+    // скрипт из черновика; если черновика нет — из всех текущих описаний
+    public int ExportSql(string path)
+    {
+        var l = new List<DescItem>(); foreach (var it in items) if (it.Dirty) l.Add(it);
+        bool draft = l.Count > 0; if (!draft) foreach (var it in items) if (it.Cur.Length > 0) l.Add(it);
+        var sb = new StringBuilder();
+        sb.AppendLine("-- LoginChanger: описания объектов (" + db.D.Title + ", " + db.Name + "), " + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + (draft ? " — черновик" : " — текущие описания"));
+        foreach (var it in l) sb.AppendLine(db.D.DescScript(it.Sch, it.Nm, it.Tp, draft ? it.New : it.Cur));
+        File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+        return l.Count;
     }
 }
 
@@ -2796,6 +3780,7 @@ class MainForm : Form
     UsersTab users;
     List<Matrix> mats = new List<Matrix>();
     Button bTheme = new Button();
+    DescriptionsTab desc;
 
     public MainForm(Db db)
     {
@@ -2811,6 +3796,8 @@ class MainForm : Form
         AddMat(Cap("Представления", Cfg.ViewPerms), new Matrix(db, new[] { "V" }, Cfg.ViewPerms.ToArray()));
         AddMat("Функции и процедуры (EXECUTE)", new Matrix(db, new[] { "P", "PC", "FN", "IF", "TF", "FS", "FT", "AF" }, null));
         AddMat(Cap("Таблицы", Cfg.TablePerms), new Matrix(db, new[] { "U" }, Cfg.TablePerms.ToArray()));
+        desc = new DescriptionsTab(db); AddPage("Описания", desc);
+        desc.Changed += delegate { foreach (var m in mats) m.Stale = true; };
 
         body.Dock = DockStyle.Fill; body.Padding = new Padding(12, 4, 12, 8);
         strip.Dock = DockStyle.Top; strip.AutoSize = true; strip.Padding = new Padding(12, 8, 12, 4);
@@ -2851,7 +3838,7 @@ class MainForm : Form
         foreach (var mm in mats)
         {
             var cur = mm;
-            cur.Changed += delegate { users.Reload(); foreach (var x in mats) if (x != cur) x.Stale = true; };
+            cur.Changed += delegate { users.Reload(); foreach (var x in mats) if (x != cur) x.Stale = true; desc.Stale = true; };
         }
         Theme.Apply(this);
     }
@@ -2868,6 +3855,7 @@ class MainForm : Form
         foreach (var m in mats) m.Recolor();
         mats[0].SetPerms(Cfg.ViewPerms.ToArray()); mats[2].SetPerms(Cfg.TablePerms.ToArray());
         foreach (var m in mats) m.Stale = true;
+        desc.Stale = true;
         tabBtns[1].Text = Cap("Представления", Cfg.ViewPerms); tabBtns[3].Text = Cap("Таблицы", Cfg.TablePerms);
         Select(cur);
     }
@@ -2894,6 +3882,7 @@ class MainForm : Form
         }
         var m = pages[i] as Matrix;
         if (m != null && m.Stale) m.Reload(true);
+        var dt = pages[i] as DescriptionsTab; if (dt != null && dt.Stale) dt.Reload(true);
     }
 }
 
