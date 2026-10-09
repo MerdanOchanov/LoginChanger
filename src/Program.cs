@@ -312,7 +312,12 @@ abstract class Dialect
         foreach (string c in cols) t.Columns.Add(c, typeof(object));
         return t;
     }
-    protected static string S(object v) { return v == null || v is DBNull ? "" : Convert.ToString(v).Trim(); }
+    protected static string S(object v)
+    {
+        if (v == null || v is DBNull) return "";
+        byte[] b = v as byte[];
+        return (b != null ? System.Text.Encoding.UTF8.GetString(b) : Convert.ToString(v)).Trim();
+    }
     protected static bool B(object v)
     {
         if (v == null || v is DBNull) return false;
@@ -331,7 +336,7 @@ class MssqlDialect : Dialect
     public override DataTable Objects(string[] types)
     {
         var tl = new List<string>(); foreach (string t in types) tl.Add("'" + t + "'");
-        return db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name");
+        return db.Query("SELECT o.object_id AS oid, s.name AS sch, o.name AS nm, RTRIM(o.type) AS tp, CONVERT(nvarchar(2000), ep.value) AS descr FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id LEFT JOIN sys.extended_properties ep ON ep.class=1 AND ep.minor_id=0 AND ep.major_id=o.object_id AND ep.name=N'MS_Description' WHERE o.is_ms_shipped=0 AND o.type IN (" + string.Join(",", tl.ToArray()) + ") ORDER BY s.name, o.name");
     }
     public override DataTable Users()
     {
@@ -383,14 +388,14 @@ class FirebirdDialect : Dialect
 
     public override DataTable Objects(string[] types)
     {
-        DataTable src = db.Query(@"SELECT TRIM(RDB$RELATION_NAME) AS nm, CASE WHEN RDB$VIEW_BLR IS NULL THEN 'U' ELSE 'V' END AS tp FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0
-UNION ALL SELECT TRIM(RDB$PROCEDURE_NAME), 'P' FROM RDB$PROCEDURES WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL
-UNION ALL SELECT TRIM(RDB$FUNCTION_NAME), 'FN' FROM RDB$FUNCTIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL");
+        DataTable src = db.Query(@"SELECT TRIM(RDB$RELATION_NAME) AS nm, CASE WHEN RDB$VIEW_BLR IS NULL THEN 'U' ELSE 'V' END AS tp, CAST(RDB$DESCRIPTION AS VARCHAR(1000)) AS d FROM RDB$RELATIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0
+UNION ALL SELECT TRIM(RDB$PROCEDURE_NAME), 'P', CAST(RDB$DESCRIPTION AS VARCHAR(1000)) FROM RDB$PROCEDURES WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL
+UNION ALL SELECT TRIM(RDB$FUNCTION_NAME), 'FN', CAST(RDB$DESCRIPTION AS VARCHAR(1000)) FROM RDB$FUNCTIONS WHERE COALESCE(RDB$SYSTEM_FLAG,0)=0 AND RDB$PACKAGE_NAME IS NULL");
         var rows = new List<string[]>();
-        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp }); }
+        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp, S(r["d"]) }); }
         rows.Sort(delegate(string[] a, string[] b) { return string.Compare(a[0], b[0], StringComparison.OrdinalIgnoreCase); });
-        DataTable t = Tbl("oid", "sch", "nm", "tp"); int id = 0;
-        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1]);
+        DataTable t = Tbl("oid", "sch", "nm", "tp", "descr"); int id = 0;
+        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1], r[2]);
         return t;
     }
     public override DataTable Users()
@@ -471,13 +476,13 @@ class MySqlDialect : Dialect
     public override DataTable Objects(string[] types)
     {
         string d = Lit(db.Name);
-        DataTable src = db.Query("SELECT TABLE_NAME AS nm, CASE WHEN TABLE_TYPE='VIEW' THEN 'V' ELSE 'U' END AS tp FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + d + " AND TABLE_TYPE IN ('BASE TABLE','VIEW') " +
-            "UNION ALL SELECT ROUTINE_NAME, CASE WHEN ROUTINE_TYPE='PROCEDURE' THEN 'P' ELSE 'FN' END FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=" + d);
+        DataTable src = db.Query("SELECT TABLE_NAME AS nm, CASE WHEN TABLE_TYPE='VIEW' THEN 'V' ELSE 'U' END AS tp, CASE WHEN TABLE_COMMENT='VIEW' THEN '' ELSE TABLE_COMMENT END AS d FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + d + " AND TABLE_TYPE IN ('BASE TABLE','VIEW') " +
+            "UNION ALL SELECT ROUTINE_NAME, CASE WHEN ROUTINE_TYPE='PROCEDURE' THEN 'P' ELSE 'FN' END, ROUTINE_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=" + d);
         var rows = new List<string[]>();
-        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp }); }
+        foreach (DataRow r in src.Rows) { string tp = S(r["tp"]); if (Wants(types, tp)) rows.Add(new[] { S(r["nm"]), tp, S(r["d"]) }); }
         rows.Sort(delegate(string[] a, string[] b) { return string.Compare(a[0], b[0], StringComparison.OrdinalIgnoreCase); });
-        DataTable t = Tbl("oid", "sch", "nm", "tp"); int id = 0;
-        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1]);
+        DataTable t = Tbl("oid", "sch", "nm", "tp", "descr"); int id = 0;
+        foreach (string[] r in rows) t.Rows.Add(++id, "", r[0], r[1], r[2]);
         return t;
     }
     static readonly string[] SysUsers = { "root", "mysql.sys", "mysql.session", "mysql.infoschema", "mariadb.sys", "debian-sys-maint" };
@@ -1919,7 +1924,7 @@ WHERE m.member_principal_id=USER_ID(@u) AND r.name NOT IN ('db_owner','db_access
 // ===== матрица прав =====
 class Matrix : Panel
 {
-    class Obj { public int Oid; public string Sch, Nm, Tp, Perm; }
+    class Obj { public int Oid; public string Sch, Nm, Tp, Perm, Descr = ""; }
     class Usr { public int Pid; public string Name, Head; public bool Out; }
 
     Db db; string[] types, perms;
@@ -2035,7 +2040,7 @@ class Matrix : Panel
             objs.Clear(); usrs.Clear(); perm.Clear();
             DataTable ot = db.D.Objects(types);
             foreach (DataRow r in ot.Rows)
-                objs.Add(new Obj { Oid = Convert.ToInt32(r["oid"]), Sch = Convert.ToString(r["sch"]), Nm = Convert.ToString(r["nm"]), Tp = Convert.ToString(r["tp"]) });
+                objs.Add(new Obj { Oid = Convert.ToInt32(r["oid"]), Sch = Convert.ToString(r["sch"]), Nm = Convert.ToString(r["nm"]), Tp = Convert.ToString(r["tp"]), Descr = ot.Columns.Contains("descr") ? Convert.ToString(r["descr"]).Trim() : "" });
             DataTable ut = db.Users();
             foreach (DataRow r in ut.Rows)
                 if (Convert.ToInt32(r["prot"]) == 0)
@@ -2049,9 +2054,10 @@ class Matrix : Panel
             var on = new List<string>(); foreach (Obj o in objs) on.Add(Full(o)); objPick.SetItems(on);
             var un = new List<string>(); foreach (Usr u in usrs) un.Add(u.Name); userPick.SetItems(un);
             g.Columns.Clear();
-            AddCol("Объект", 300, true); AddCol("Все", 64, true); AddCol("Право", 70, true);
+            AddCol("Объект", 300, true); AddCol("Все", 64, true); AddCol("Описание", 300, true);
             g.Columns[1].Tag = "nocsv"; g.Columns[1].ToolTipText = "Выдать или снять право всем пользователям в этой строке";
-            g.Columns[2].Visible = false;
+            g.Columns[2].DisplayIndex = 1;   // описание — сразу после имени объекта
+            g.Columns[2].Visible = objs.Exists(delegate(Obj o) { return o.Descr.Length > 0; });
             foreach (Usr u in usrs)
             {
                 var c = new DataGridViewCheckBoxColumn { HeaderText = u.Head, Width = 124, ReadOnly = true, Tag = u.Pid, SortMode = DataGridViewColumnSortMode.NotSortable };
@@ -2087,7 +2093,7 @@ class Matrix : Panel
             var vals = new object[FixedCols + usrs.Count];
             foreach (Obj o in objs)
             {
-                vals[0] = Full(o); vals[1] = o.Tp; vals[2] = o.Perm;
+                vals[0] = Full(o); vals[1] = o.Tp; vals[2] = o.Descr;
                 for (int i = 0; i < usrs.Count; i++)
                 {
                     char st; perm.TryGetValue(Key(usrs[i].Pid, o.Oid, o.Perm), out st);
@@ -2096,6 +2102,7 @@ class Matrix : Panel
                 int ri = g.Rows.Add(vals);
                 g.Rows[ri].Tag = o;
                 g.Rows[ri].Cells[0].ToolTipText = "Право: " + o.Perm + " · " + KindName(o.Tp);
+                g.Rows[ri].Cells[2].ToolTipText = o.Descr;
                 PaintRow(g.Rows[ri]);
             }
             Filter();
@@ -2117,7 +2124,7 @@ class Matrix : Panel
         foreach (DataGridViewRow r in g.Rows)
         {
             var o = (Obj)r.Tag;
-            string n = Full(o).ToLower();
+            string n = (Full(o) + " " + o.Descr).ToLower();
             bool ok = sch == null || o.Sch == sch;
             if (ok && objPick.Checked.Count > 0 && !objPick.Checked.Contains(Full(o))) ok = false;
             foreach (string w in inc) if (ok && !n.Contains(w)) ok = false;
