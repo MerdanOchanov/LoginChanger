@@ -64,6 +64,8 @@
     <div class="card"><div class="ico">▦</div><h3>Матрица прав</h3><p>Представления — SELECT, процедуры и функции — EXECUTE, таблицы — SELECT. Зелёные ячейки — доступ есть, красные — запрещено.</p></div>
     <div class="card"><div class="ico">☑</div><h3>Массовая расстановка</h3><p>«Все» по столбцу и по строке, диапазон по <kbd>Shift</kbd>, выбор ячеек по <kbd>Ctrl</kbd>. Крупные чекбоксы, срабатывают по клику в любом месте ячейки.</p></div>
     <div class="card"><div class="ico">🔎</div><h3>Быстрый поиск и фильтры</h3><p>Поиск по словам, исключение <code>-слово</code>, схема, режим «выдано / не выдано / изменено» и выпадающие списки с галочками.</p></div>
+    <div class="card"><div class="ico">🔑</div><h3>Не только SELECT</h3><p>INSERT, UPDATE, DELETE и REFERENCES включаются в настройках. Над матрицей появляется выбор права — те же галочки, откат и подсветка.</p></div>
+    <div class="card"><div class="ico">⚙</div><h3>Окно настроек</h3><p>Права на вкладках, длина паролей, таймауты, подтверждения, формат CSV, срок журнала, папка шаблонов, тема — всё в одном месте.</p></div>
     <div class="card"><div class="ico">📝</div><h3>Описания объектов рядом</h3><p>Свойство <code>MS_Description</code> (а в Firebird и MySQL — комментарии) показывается возле имени, поиск работает и по описанию. Не нужно гадать, что за <code>AN_ALL_BANK_LINES</code>.</p></div>
     <div class="card"><div class="ico">👤</div><h3>Быстрое создание</h3><p>Новый логин и пользователь БД с генератором пароля (8 символов, легко вводить), права по шаблону или «как у другого».</p></div>
     <div class="card"><div class="ico">⎘</div><h3>Массовое создание</h3><p>Вставьте список логинов — получите готовую таблицу «логин — пароль — результат» и экспорт в CSV.</p></div>
@@ -83,6 +85,8 @@
     <figure><div class="shot"><img src="img/dark.png" alt="Тёмная тема" loading="lazy"></div><figcaption>Тёмная тема</figcaption></figure>
     <figure><div class="shot"><img src="img/bulk2_clean.png" alt="Результат массового создания" loading="lazy"></div><figcaption>Массовое создание: пароли и результат по каждому</figcaption></figure>
     <figure><div class="shot"><img src="img/create_clean.png" alt="Создание пользователя" loading="lazy"></div><figcaption>Создание пользователя по шаблону с готовым паролем</figcaption></figure>
+    <figure><div class="shot"><img src="img/matrix_perms_clean.png" alt="Выбор права над матрицей" loading="lazy"></div><figcaption>Право выбирается над матрицей: SELECT, INSERT, UPDATE, DELETE…</figcaption></figure>
+    <figure><div class="shot"><img src="img/settings.png" alt="Окно настроек" loading="lazy" style="max-height:520px;width:auto;margin-inline:auto"></div><figcaption>Окно настроек</figcaption></figure>
     <figure><div class="shot"><img src="img/picker_clean.png" alt="Выпадающий список с галочками" loading="lazy" style="margin-inline:auto"></div><figcaption>Список с галочками и поиском внутри</figcaption></figure>
     <figure><div class="shot"><img src="img/orphan.png" alt="Починка сироты" loading="lazy"></div><figcaption>Если учётной записи Windows уже нет — понятные варианты</figcaption></figure>
   </div>
@@ -132,6 +136,7 @@
   <details><summary>Что если я случайно выдал лишнее?</summary><p>Нажмите «Откатить последнее» — обратные команды выполнятся одной транзакцией. Откат хранится до закрытия программы; все команды также записаны в журнал.</p></details>
   <details><summary>А PostgreSQL?</summary><p>В планах, следующий на очереди. Следите за репозиторием или поставьте звезду, чтобы не пропустить релиз.</p></details>
   <details><summary>Откат работает в MySQL?</summary><p>Да, но у MySQL права нельзя откатить транзакцией: при ошибке программа сама выполняет обратные команды для уже применённых изменений, а «Откатить последнее» возвращает прошлое состояние.</p></details>
+  <details><summary>Можно ли выдавать права не только на чтение?</summary><p>Да. В «Настройках» отметьте INSERT, UPDATE, DELETE (для таблиц ещё REFERENCES) — над матрицей появится выбор права. Процедуры и функции получают EXECUTE.</p></details>
   <details><summary>Это бесплатно?</summary><p>Да, лицензия MIT: используйте в работе, меняйте, распространяйте.</p></details>
 </div></section>
 

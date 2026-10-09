@@ -22,7 +22,7 @@ static class App
     public static void Log(string s)
     {
         string line = DateTime.Now.ToString("HH:mm:ss") + "  " + s;
-        try
+        if (Cfg.LogToFile) try
         {
             string d = Path.Combine(Dir, "logs");
             Directory.CreateDirectory(d);
@@ -34,6 +34,18 @@ static class App
     }
 
     static string IniPath { get { return Path.Combine(Dir, "loginchanger.ini"); } }
+    public static string TemplatesDir { get { return string.IsNullOrEmpty(Cfg.TplDir) ? Path.Combine(Dir, "templates") : Cfg.TplDir; } }
+    // удаляем журналы старше заданного числа дней
+    public static void PurgeLogs()
+    {
+        try
+        {
+            string d = Path.Combine(Dir, "logs"); if (!Directory.Exists(d)) return;
+            foreach (string f in Directory.GetFiles(d, "*.log"))
+                if ((DateTime.Now - File.GetLastWriteTime(f)).TotalDays > Cfg.LogDays) File.Delete(f);
+        }
+        catch { }
+    }
     public static Dictionary<string, string> LoadIni()
     {
         var d = new Dictionary<string, string>();
@@ -70,6 +82,7 @@ static class App
         var chars = new List<char>();
         chars.Add(up[Rnd(up.Length)]);
         chars.Add(di[Rnd(di.Length)]); chars.Add(di[Rnd(di.Length)]);
+        if (Cfg.PwdSymbol) chars.Add("!#$%&*+-=?@^_"[Rnd(13)]);
         while (chars.Count < n) chars.Add(lo[Rnd(lo.Length)]);
         for (int i = chars.Count - 1; i > 0; i--)
         {
@@ -204,7 +217,7 @@ class Db
     DbCommand Cmd(string sql, object[] p)
     {
         var c = C.CreateCommand();
-        c.CommandText = sql; c.CommandTimeout = 60; c.Transaction = Tx;
+        c.CommandText = sql; c.CommandTimeout = Cfg.CmdTimeout; c.Transaction = Tx;
         for (int i = 0; p != null && i + 1 < p.Length; i += 2)
         {
             var q = c.CreateParameter(); q.ParameterName = (string)p[i]; q.Value = p[i + 1] ?? DBNull.Value; c.Parameters.Add(q);
@@ -360,7 +373,7 @@ class MssqlDialect : Dialect
     }
     public override DataTable Perms(DataTable objs, DataTable users)
     {
-        return db.Query("SELECT dp.grantee_principal_id AS gid, dp.major_id AS oid, dp.permission_name AS pn, dp.state AS st FROM sys.database_permissions dp WHERE dp.class=1 AND dp.minor_id=0 AND dp.permission_name IN ('SELECT','EXECUTE','INSERT','UPDATE','DELETE')");
+        return db.Query("SELECT dp.grantee_principal_id AS gid, dp.major_id AS oid, dp.permission_name AS pn, dp.state AS st FROM sys.database_permissions dp WHERE dp.class=1 AND dp.minor_id=0 AND dp.permission_name IN ('SELECT','EXECUTE','INSERT','UPDATE','DELETE','REFERENCES')");
     }
     string Obj(string sch, string nm) { return "OBJECT::" + App.Q(sch) + "." + App.Q(nm); }
     public override string Grant(string sch, string nm, string tp, string perm, string user) { return "GRANT " + perm + " ON " + Obj(sch, nm) + " TO " + App.Q(user); }
@@ -420,13 +433,13 @@ UNION ALL SELECT TRIM(RDB$FUNCTION_NAME), 'FN', CAST(RDB$DESCRIPTION AS VARCHAR(
         }
         var uid = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (DataRow r in users.Rows) uid[S(r["nm"])] = Convert.ToInt32(r["pid"]);
-        DataTable p = db.Query("SELECT TRIM(RDB$USER) AS u, TRIM(RDB$RELATION_NAME) AS r, RDB$OBJECT_TYPE AS t, RDB$PRIVILEGE AS p FROM RDB$USER_PRIVILEGES WHERE RDB$USER_TYPE=8 AND RDB$PRIVILEGE IN ('S','X') AND RDB$FIELD_NAME IS NULL");
+        DataTable p = db.Query("SELECT TRIM(RDB$USER) AS u, TRIM(RDB$RELATION_NAME) AS r, RDB$OBJECT_TYPE AS t, RDB$PRIVILEGE AS p FROM RDB$USER_PRIVILEGES WHERE RDB$USER_TYPE=8 AND RDB$PRIVILEGE IN ('S','I','U','D','R','X') AND RDB$FIELD_NAME IS NULL");
         DataTable t = Tbl("gid", "oid", "pn", "st");
         foreach (DataRow r in p.Rows)
         {
             int g, o; string u = S(r["u"]), n = S(r["r"]), priv = S(r["p"]); int ot = Convert.ToInt32(r["t"]);
             if (!uid.TryGetValue(u, out g)) continue;
-            if (priv == "S" && ot == 0 && rel.TryGetValue(n, out o)) t.Rows.Add(g, o, "SELECT", "G");
+            if (priv != "X" && ot == 0 && rel.TryGetValue(n, out o)) t.Rows.Add(g, o, priv == "S" ? "SELECT" : priv == "I" ? "INSERT" : priv == "U" ? "UPDATE" : priv == "D" ? "DELETE" : "REFERENCES", "G");
             else if (priv == "X" && ot == 5 && pro.TryGetValue(n, out o)) t.Rows.Add(g, o, "EXECUTE", "G");
             else if (priv == "X" && ot == 15 && fn.TryGetValue(n, out o)) t.Rows.Add(g, o, "EXECUTE", "G");
         }
@@ -514,7 +527,9 @@ class MySqlDialect : Dialect
         {
             int g, o;
             if (!uid.TryGetValue(S(r["u"]) + "@" + S(r["h"]), out g)) continue;
-            if (("," + S(r["p"]).ToLower() + ",").Contains(",select,") && rel.TryGetValue(S(r["n"]), out o)) t.Rows.Add(g, o, "SELECT", "G");
+            if (!rel.TryGetValue(S(r["n"]), out o)) continue;
+            string pl = "," + S(r["p"]).ToLower() + ",";
+            foreach (string pn in new[] { "select", "insert", "update", "delete", "references" }) if (pl.Contains("," + pn + ",")) t.Rows.Add(g, o, pn.ToUpper(), "G");
         }
         foreach (DataRow r in db.Query("SELECT User AS u, Host AS h, Routine_name AS n, Routine_type AS rt, Proc_priv AS p FROM mysql.procs_priv WHERE Db=" + d).Rows)
         {
@@ -552,6 +567,268 @@ class MySqlDialect : Dialect
     public override void ChangePassword(string name, string pwd) { db.Exec("ALTER USER " + UserRef(name) + " IDENTIFIED BY " + Lit(pwd), "ALTER USER " + UserRef(name) + " IDENTIFIED BY '***'"); }
 }
 
+// ===== настройки (хранятся в loginchanger.ini рядом с программой, ключи s_*; пароли не сохраняются) =====
+static class Cfg
+{
+    public static string Theme = "light";                 // light | dark | auto (как в системе)
+    public static bool ConfirmApply = true, ConfirmUndo = true;
+    public static int PwdLen = 8;
+    public static bool PwdSymbol = false, PolicyOff = false;
+    public static int ConnTimeout = 10, CmdTimeout = 60;
+    public static bool TrustCert = true, Encrypt = false, RememberServers = true;
+    public static bool ShowDescr = true;
+    public static string CsvDelim = ";", CsvEnc = "utf8bom", CsvMark = "+";
+    public static bool LogToFile = true; public static int LogDays = 30;
+    public static string TplDir = "";
+    public static List<string> ViewPerms = new List<string>(new[] { "SELECT" });
+    public static List<string> TablePerms = new List<string>(new[] { "SELECT" });
+
+    public static readonly string[] ViewAll = { "SELECT", "INSERT", "UPDATE", "DELETE" };
+    public static readonly string[] TableAll = { "SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES" };
+
+    static bool B(Dictionary<string, string> d, string k, bool def) { string v; return d.TryGetValue(k, out v) ? v == "1" : def; }
+    static int I(Dictionary<string, string> d, string k, int def, int lo, int hi)
+    {
+        string v; int n;
+        if (d.TryGetValue(k, out v) && int.TryParse(v, out n)) return Math.Max(lo, Math.Min(hi, n));
+        return def;
+    }
+    static string S(Dictionary<string, string> d, string k, string def) { string v; return d.TryGetValue(k, out v) ? v : def; }
+    static List<string> Perms(Dictionary<string, string> d, string k, string[] all)
+    {
+        var l = new List<string> { "SELECT" };
+        string v; if (!d.TryGetValue(k, out v)) return l;
+        foreach (string p in v.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            if (Array.IndexOf(all, p) >= 0 && !l.Contains(p)) l.Add(p);
+        return l;
+    }
+
+    public static void Load()
+    {
+        var d = App.LoadIni();
+        Theme = S(d, "theme", "light"); if (Theme != "dark" && Theme != "auto") Theme = "light";
+        ConfirmApply = B(d, "s_confirm_apply", true); ConfirmUndo = B(d, "s_confirm_undo", true);
+        PwdLen = I(d, "s_pwd_len", 8, 6, 32); PwdSymbol = B(d, "s_pwd_symbol", false); PolicyOff = B(d, "s_policy_off", false);
+        ConnTimeout = I(d, "s_conn_timeout", 10, 3, 120); CmdTimeout = I(d, "s_cmd_timeout", 60, 10, 600);
+        TrustCert = B(d, "s_trust_cert", true); Encrypt = B(d, "s_encrypt", false); RememberServers = B(d, "s_remember_servers", true);
+        ShowDescr = B(d, "s_show_descr", true);
+        CsvDelim = S(d, "s_csv_delim", ";"); if (CsvDelim != "," && CsvDelim != "\t") CsvDelim = ";";
+        CsvEnc = S(d, "s_csv_enc", "utf8bom"); if (CsvEnc != "utf8" && CsvEnc != "cp1251") CsvEnc = "utf8bom";
+        CsvMark = S(d, "s_csv_mark", "+"); if (CsvMark.Length == 0 || CsvMark.Length > 3) CsvMark = "+";
+        LogToFile = B(d, "s_log_file", true); LogDays = I(d, "s_log_days", 30, 1, 365);
+        TplDir = S(d, "s_tpl_dir", "");
+        ViewPerms = Perms(d, "s_view_perms", ViewAll); TablePerms = Perms(d, "s_table_perms", TableAll);
+    }
+
+    public static void Defaults()
+    {
+        Theme = "light"; ConfirmApply = true; ConfirmUndo = true; PwdLen = 8; PwdSymbol = false; PolicyOff = false;
+        ConnTimeout = 10; CmdTimeout = 60; TrustCert = true; Encrypt = false; RememberServers = true; ShowDescr = true;
+        CsvDelim = ";"; CsvEnc = "utf8bom"; CsvMark = "+"; LogToFile = true; LogDays = 30; TplDir = "";
+        ViewPerms = new List<string>(new[] { "SELECT" }); TablePerms = new List<string>(new[] { "SELECT" });
+    }
+
+    static string F(bool b) { return b ? "1" : "0"; }
+    public static void Save()
+    {
+        var d = App.LoadIni();
+        d["theme"] = Theme;
+        d["s_confirm_apply"] = F(ConfirmApply); d["s_confirm_undo"] = F(ConfirmUndo);
+        d["s_pwd_len"] = PwdLen.ToString(); d["s_pwd_symbol"] = F(PwdSymbol); d["s_policy_off"] = F(PolicyOff);
+        d["s_conn_timeout"] = ConnTimeout.ToString(); d["s_cmd_timeout"] = CmdTimeout.ToString();
+        d["s_trust_cert"] = F(TrustCert); d["s_encrypt"] = F(Encrypt); d["s_remember_servers"] = F(RememberServers);
+        d["s_show_descr"] = F(ShowDescr);
+        d["s_csv_delim"] = CsvDelim; d["s_csv_enc"] = CsvEnc; d["s_csv_mark"] = CsvMark;
+        d["s_log_file"] = F(LogToFile); d["s_log_days"] = LogDays.ToString();
+        d["s_tpl_dir"] = TplDir;
+        d["s_view_perms"] = string.Join(",", ViewPerms.ToArray()); d["s_table_perms"] = string.Join(",", TablePerms.ToArray());
+        if (!RememberServers) d.Remove("servers");
+        App.SaveIni(d);
+    }
+
+    // тёмная ли тема сейчас (для режима «как в системе» читаем настройку Windows)
+    public static bool IsDark()
+    {
+        if (Theme == "dark") return true;
+        if (Theme == "light") return false;
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+            {
+                object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                return v != null && Convert.ToInt32(v) == 0;
+            }
+        }
+        catch { return false; }
+    }
+}
+
+// ===== окно настроек =====
+class SettingsForm : Form
+{
+    CheckBox[] vp, tp;
+    NumericUpDown nPwd = new NumericUpDown(), nConn = new NumericUpDown(), nCmd = new NumericUpDown(), nLog = new NumericUpDown();
+    CheckBox cSym = new CheckBox(), cPol = new CheckBox(), cCA = new CheckBox(), cCU = new CheckBox(), cTrust = new CheckBox(), cEnc = new CheckBox(),
+             cRem = new CheckBox(), cDescr = new CheckBox(), cLog = new CheckBox();
+    FlatCombo cDelim = new FlatCombo(), cCsvEnc = new FlatCombo(), cTheme = new FlatCombo();
+    TextBox tMark = new TextBox(), tTpl = new TextBox();
+    TableLayoutPanel tl;
+
+    public SettingsForm()
+    {
+        Text = "Настройки"; AutoScaleMode = AutoScaleMode.Dpi; Font = new Font("Segoe UI", 10f);
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        StartPosition = FormStartPosition.CenterParent; ShowInTaskbar = false; MinimizeBox = false;
+        MinimumSize = new Size(620, 460); Size = new Size(760, Math.Min(780, Screen.PrimaryScreen.WorkingArea.Height - 40));
+
+        var body = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(0) };
+        tl = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(24, 12, 24, 12) };
+        tl.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 270));
+        tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        body.Controls.Add(tl);
+
+        vp = PermBoxes(Cfg.ViewAll); tp = PermBoxes(Cfg.TableAll);
+        Section("Права в матрицах");
+        Row("Представления:", PermRow(vp));
+        Row("Таблицы:", PermRow(tp));
+        Note("SELECT включён всегда. Если отмечено больше одного права, над матрицей появляется выбор «Право». Процедуры и функции — всегда EXECUTE (для табличных функций SQL Server сам использует SELECT).");
+
+        Section("Пароли");
+        nPwd.Minimum = 6; nPwd.Maximum = 32; nPwd.Width = 80; Row("Длина сгенерированного пароля:", nPwd);
+        cSym.Text = "Добавлять спецсимвол (для строгих политик паролей)"; CheckRow(cSym);
+        cPol.Text = "По умолчанию не проверять сложность пароля сервером (SQL Server)"; CheckRow(cPol);
+
+        Section("Подтверждения");
+        cCA.Text = "Спрашивать подтверждение перед «Применить»"; CheckRow(cCA);
+        cCU.Text = "Спрашивать подтверждение перед «Откатить последнее»"; CheckRow(cCU);
+        Note("Защита администраторов (sa, dbo, sysadmin, db_owner и т. п.) включена всегда и отключению не подлежит.");
+
+        Section("Подключение");
+        nConn.Minimum = 3; nConn.Maximum = 120; nConn.Width = 80; Row("Таймаут подключения, с:", nConn);
+        nCmd.Minimum = 10; nCmd.Maximum = 600; nCmd.Width = 80; Row("Таймаут команд, с:", nCmd);
+        cTrust.Text = "Доверять сертификату сервера (SQL Server)"; CheckRow(cTrust);
+        cEnc.Text = "Шифровать соединение (SQL Server)"; CheckRow(cEnc);
+        cRem.Text = "Запоминать список серверов"; CheckRow(cRem);
+
+        Section("Матрица");
+        cDescr.Text = "Показывать колонку «Описание» (MS_Description и комментарии)"; CheckRow(cDescr);
+
+        Section("Экспорт CSV");
+        cDelim.Items.AddRange(new object[] { "; точка с запятой (Excel, русская локаль)", ", запятая", "Табуляция" }); cDelim.Width = 340; Row("Разделитель:", cDelim);
+        cCsvEnc.Items.AddRange(new object[] { "UTF-8 с BOM (Excel откроет без проблем)", "UTF-8", "Windows-1251" }); cCsvEnc.Width = 340; Row("Кодировка:", cCsvEnc);
+        tMark.Width = 60; tMark.MaxLength = 3; Row("Знак «доступ есть»:", tMark);
+
+        Section("Файлы и журнал");
+        cLog.Text = "Вести журнал в файл (папка logs)"; CheckRow(cLog);
+        nLog.Minimum = 1; nLog.Maximum = 365; nLog.Width = 80; Row("Хранить журнал, дней:", nLog);
+        var bLogs = new Button { Text = "Открыть папку журнала", AutoSize = true };
+        bLogs.Click += delegate
+        {
+            try { string d = Path.Combine(App.Dir, "logs"); Directory.CreateDirectory(d); System.Diagnostics.Process.Start("explorer.exe", d); } catch (Exception ex) { UI.Warn(ex.Message); }
+        };
+        Row("", bLogs);
+        var pt = new Panel { Height = 32, MinimumSize = new Size(0, 32) };
+        var bBr = new Button { Text = "Обзор…", Dock = DockStyle.Right, Width = 90 }; tTpl.Dock = DockStyle.Fill;
+        pt.Controls.Add(tTpl); pt.Controls.Add(bBr);
+        bBr.Click += delegate
+        {
+            using (var fb = new FolderBrowserDialog()) { fb.Description = "Папка шаблонов прав (.tpl)"; if (fb.ShowDialog(this) == DialogResult.OK) tTpl.Text = fb.SelectedPath; }
+        };
+        Row("Папка шаблонов:", pt);
+        Note("Пусто — папка templates рядом с программой. Файл настроек: " + Path.Combine(App.Dir, "loginchanger.ini"));
+
+        Section("Внешний вид");
+        cTheme.Items.AddRange(new object[] { "Светлая", "Тёмная", "Как в системе" }); cTheme.Width = 220; Row("Тема:", cTheme);
+
+        var foot = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Padding = new Padding(16, 10, 16, 12) };
+        var ok = new Button { Text = "Сохранить", Tag = "primary", AutoSize = true, DialogResult = DialogResult.OK };
+        var cn = new Button { Text = "Отмена", AutoSize = true, DialogResult = DialogResult.Cancel };
+        var rs = new Button { Text = "По умолчанию", AutoSize = true, Tag = "ghost" };
+        foot.Controls.Add(ok); foot.Controls.Add(cn); foot.Controls.Add(rs);
+        Controls.Add(body); Controls.Add(foot);
+        AcceptButton = ok; CancelButton = cn;
+        ok.Click += delegate { Collect(); };
+        rs.Click += delegate { Cfg.Defaults(); LoadValues(); };
+        FormClosed += delegate { if (DialogResult != DialogResult.OK) Cfg.Load(); };   // отмена — возвращаем сохранённые значения
+        LoadValues();
+        Theme.Apply(this);
+    }
+
+    static CheckBox[] PermBoxes(string[] all)
+    {
+        var l = new CheckBox[all.Length];
+        for (int i = 0; i < all.Length; i++) l[i] = new CheckBox { Text = all[i], AutoSize = true, Margin = new Padding(0, 0, 16, 0) };
+        l[0].Enabled = false;   // SELECT всегда
+        return l;
+    }
+    static Control PermRow(CheckBox[] boxes)
+    {
+        var f = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Margin = new Padding(0) };
+        foreach (var b in boxes) f.Controls.Add(b);
+        return f;
+    }
+
+    void Section(string title)
+    {
+        int r = tl.RowCount++;
+        var p = new Panel { Height = 34, Dock = DockStyle.Fill, Margin = new Padding(0, 14, 0, 4) };
+        var lbl = new Label { Text = title, AutoSize = true, Font = new Font("Segoe UI Semibold", 11.5f), Location = new Point(0, 4) };
+        var line = new Panel { Height = 1, Dock = DockStyle.Bottom, Tag = "line" };
+        p.Controls.Add(lbl); p.Controls.Add(line);
+        tl.Controls.Add(p, 0, r); tl.SetColumnSpan(p, 2);
+    }
+    void Row(string label, Control c)
+    {
+        int r = tl.RowCount++;
+        tl.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 12, 7) }, 0, r);
+        c.Margin = new Padding(3, 4, 3, 4); c.Anchor = AnchorStyles.Left; tl.Controls.Add(c, 1, r);
+    }
+    void CheckRow(CheckBox c)
+    {
+        int r = tl.RowCount++;
+        c.AutoSize = true; c.Margin = new Padding(3, 6, 3, 6);
+        tl.Controls.Add(c, 0, r); tl.SetColumnSpan(c, 2);
+    }
+    void Note(string text)
+    {
+        int r = tl.RowCount++;
+        var l = new Label { Text = text, AutoSize = true, MaximumSize = new Size(640, 0), Tag = "muted", Margin = new Padding(3, 4, 3, 6) };
+        tl.Controls.Add(l, 0, r); tl.SetColumnSpan(l, 2);
+    }
+
+    static void Mark(CheckBox[] boxes, List<string> perms) { for (int i = 0; i < boxes.Length; i++) boxes[i].Checked = i == 0 || perms.Contains(boxes[i].Text); }
+    static List<string> Marked(CheckBox[] boxes) { var l = new List<string> { "SELECT" }; for (int i = 1; i < boxes.Length; i++) if (boxes[i].Checked) l.Add(boxes[i].Text); return l; }
+
+    void LoadValues()
+    {
+        Mark(vp, Cfg.ViewPerms); Mark(tp, Cfg.TablePerms);
+        nPwd.Value = Cfg.PwdLen; cSym.Checked = Cfg.PwdSymbol; cPol.Checked = Cfg.PolicyOff;
+        cCA.Checked = Cfg.ConfirmApply; cCU.Checked = Cfg.ConfirmUndo;
+        nConn.Value = Cfg.ConnTimeout; nCmd.Value = Cfg.CmdTimeout; cTrust.Checked = Cfg.TrustCert; cEnc.Checked = Cfg.Encrypt; cRem.Checked = Cfg.RememberServers;
+        cDescr.Checked = Cfg.ShowDescr;
+        cDelim.SelectedIndex = Cfg.CsvDelim == "," ? 1 : Cfg.CsvDelim == "\t" ? 2 : 0;
+        cCsvEnc.SelectedIndex = Cfg.CsvEnc == "utf8" ? 1 : Cfg.CsvEnc == "cp1251" ? 2 : 0;
+        tMark.Text = Cfg.CsvMark;
+        cLog.Checked = Cfg.LogToFile; nLog.Value = Cfg.LogDays; tTpl.Text = Cfg.TplDir;
+        cTheme.SelectedIndex = Cfg.Theme == "dark" ? 1 : Cfg.Theme == "auto" ? 2 : 0;
+    }
+
+    void Collect()
+    {
+        Cfg.ViewPerms = Marked(vp); Cfg.TablePerms = Marked(tp);
+        Cfg.PwdLen = (int)nPwd.Value; Cfg.PwdSymbol = cSym.Checked; Cfg.PolicyOff = cPol.Checked;
+        Cfg.ConfirmApply = cCA.Checked; Cfg.ConfirmUndo = cCU.Checked;
+        Cfg.ConnTimeout = (int)nConn.Value; Cfg.CmdTimeout = (int)nCmd.Value; Cfg.TrustCert = cTrust.Checked; Cfg.Encrypt = cEnc.Checked; Cfg.RememberServers = cRem.Checked;
+        Cfg.ShowDescr = cDescr.Checked;
+        Cfg.CsvDelim = cDelim.SelectedIndex == 1 ? "," : cDelim.SelectedIndex == 2 ? "\t" : ";";
+        Cfg.CsvEnc = cCsvEnc.SelectedIndex == 1 ? "utf8" : cCsvEnc.SelectedIndex == 2 ? "cp1251" : "utf8bom";
+        Cfg.CsvMark = tMark.Text.Trim().Length == 0 ? "+" : tMark.Text.Trim();
+        Cfg.LogToFile = cLog.Checked; Cfg.LogDays = (int)nLog.Value; Cfg.TplDir = tTpl.Text.Trim();
+        Cfg.Theme = cTheme.SelectedIndex == 1 ? "dark" : cTheme.SelectedIndex == 2 ? "auto" : "light";
+        Cfg.Save();
+    }
+}
+
 // ===== тема =====
 static class Theme
 {
@@ -585,7 +862,8 @@ static class Theme
     public static void Toggle()
     {
         Init(!Dark);
-        var d = App.LoadIni(); d["theme"] = Dark ? "dark" : "light"; App.SaveIni(d);
+        Cfg.Theme = Dark ? "dark" : "light";
+        var d = App.LoadIni(); d["theme"] = Cfg.Theme; App.SaveIni(d);
     }
 
     public static string Label { get { return Dark ? "Тема: тёмная" : "Тема: светлая"; } }
@@ -637,6 +915,8 @@ static class Theme
             string t = k.Tag as string;
             k.ForeColor = t == "muted" ? Muted : t == "err" ? Err : Fg;
         }
+        else if (k is NumericUpDown) { k.BackColor = Input; k.ForeColor = Fg; }
+        else if (k is Panel && (k.Tag as string) == "line") k.BackColor = Border;
         else if (k is DataGridView) Grid((DataGridView)k);
         else if (k is SplitContainer) k.BackColor = Border;
         else
@@ -688,7 +968,7 @@ class ConnForm : Form
         tServer.DropDownStyle = ComboBoxStyle.DropDown;
         bFind.Text = "Найти"; bFind.Dock = DockStyle.Right; bFind.Width = 90;
         foreach (string s in LocalInstances()) AddServer(s);
-        if (ini.ContainsKey("servers"))
+        if (Cfg.RememberServers && ini.ContainsKey("servers"))
             foreach (string s in ini["servers"].Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries)) AddServer(s);
         cAuth.Items.AddRange(new object[] { "Windows-аутентификация", "SQL Server (sa и т.п.)" });
         cAuth.SelectedIndex = (ini.ContainsKey("auth") && ini["auth"] == "1") ? 1 : 0;
@@ -699,6 +979,7 @@ class ConnForm : Form
         bOk.Text = "Выбрать базу"; bOk.AutoSize = true; bOk.MinimumSize = new Size(170, 36); bOk.Enabled = false;
         lMsg.AutoSize = true; lMsg.MaximumSize = new Size(440, 0); lMsg.Margin = new Padding(3, 8, 3, 8);
         bTheme.Text = Theme.Label; bTheme.AutoSize = true; bTheme.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+        var bSet = new Button { Text = "Настройки", AutoSize = true, Anchor = AnchorStyles.Top | AnchorStyles.Right };
 
         var title = new Label { Text = "LoginChanger", AutoSize = true, Font = new Font("Segoe UI Semibold", 20f), Margin = new Padding(3, 0, 3, 0) };
         var sub = new Label { Text = "Быстрые пользователи и права для баз данных", AutoSize = true, Tag = "muted", Margin = new Padding(3, 0, 3, 16) };
@@ -723,8 +1004,13 @@ class ConnForm : Form
         lDb = AddRow(tl, "База данных:", cDb);
         r = tl.RowCount++; tl.Controls.Add(bOk, 1, r);
         lDb.Visible = cDb.Visible = bOk.Visible = false;
-        Controls.Add(tl); Controls.Add(bTheme); bTheme.BringToFront();
-        Load += delegate { bTheme.Location = new Point(ClientSize.Width - bTheme.Width - 16, 14); };
+        Controls.Add(tl); Controls.Add(bTheme); Controls.Add(bSet); bTheme.BringToFront(); bSet.BringToFront();
+        Load += delegate { bTheme.Location = new Point(ClientSize.Width - bTheme.Width - 16, 14); bSet.Location = new Point(bTheme.Left - bSet.Width - 8, 14); };
+        bSet.Click += delegate
+        {
+            using (var sf = new SettingsForm())
+                if (sf.ShowDialog(this) == DialogResult.OK) { Theme.Init(Cfg.IsDark()); Theme.Apply(this); bTheme.Text = Theme.Label; }
+        };
 
         cEng.SelectedIndexChanged += delegate { ApplyEngine(true); };
         cAuth.SelectedIndexChanged += delegate { tUser.Enabled = tPass.Enabled = cAuth.SelectedIndex == 1; Reset(null, null); };
@@ -923,7 +1209,7 @@ class ConnForm : Form
             {
                 var sb = new SqlConnectionStringBuilder();
                 sb.DataSource = tServer.Text.Trim(); sb.InitialCatalog = "master";
-                sb.TrustServerCertificate = true; sb.ConnectTimeout = 10; sb.ApplicationName = "LoginChanger";
+                sb.TrustServerCertificate = Cfg.TrustCert; sb.Encrypt = Cfg.Encrypt; sb.ConnectTimeout = Cfg.ConnTimeout; sb.ApplicationName = "LoginChanger";
                 if (cAuth.SelectedIndex == 0) sb.IntegratedSecurity = true;
                 else { sb.UserID = tUser.Text.Trim(); sb.Password = tPass.Text; }
                 conn = new SqlConnection(sb.ConnectionString);
@@ -938,7 +1224,7 @@ class ConnForm : Form
             else
             {
                 var oc = new System.Data.Odbc.OdbcConnection(OdbcString());
-                conn = oc; oc.ConnectionTimeout = 10; oc.Open();
+                conn = oc; oc.ConnectionTimeout = Cfg.ConnTimeout; oc.Open();
                 if (Eng == 2)
                 {
                     using (var c = conn.CreateCommand())
@@ -1002,7 +1288,7 @@ class ConnForm : Form
             if (Eng == 0 || Eng == 2) ini["db"] = d.Name;
             if (Eng == 1) ini["fbfile"] = tFile.Text.Trim();
             var sv = new List<string>(); foreach (object o in tServer.Items) sv.Add((string)o);
-            ini["servers"] = string.Join(";", sv.ToArray());
+            ini["servers"] = Cfg.RememberServers ? string.Join(";", sv.ToArray()) : "";
             App.SaveIni(ini);
             App.Log("Открыта БД " + d.Name + " (" + d.D.Title + ") как " + d.Who);
             Result = d; DialogResult = DialogResult.OK;
@@ -1018,10 +1304,10 @@ class PwdBox : Panel
     public PwdBox()
     {
         Height = 36; MinimumSize = new Size(0, 36); Dock = DockStyle.Fill;
-        T.Dock = DockStyle.Fill; T.Font = new Font("Consolas", 12f); T.Text = App.GenPwd(8);
+        T.Dock = DockStyle.Fill; T.Font = new Font("Consolas", 12f); T.Text = App.GenPwd(Cfg.PwdLen);
         var g = new Button { Text = "Новый", Dock = DockStyle.Right, Width = 90 };
         var c = new Button { Text = "Копировать", Dock = DockStyle.Right, Width = 110 };
-        g.Click += delegate { T.Text = App.GenPwd(8); };
+        g.Click += delegate { T.Text = App.GenPwd(Cfg.PwdLen); };
         c.Click += delegate { try { Clipboard.SetText(T.Text); } catch { } };
         Controls.Add(T); Controls.Add(g); Controls.Add(c);
     }
@@ -1067,7 +1353,7 @@ class CreateForm : Form
         Tpl.Items.Add("(без прав)");
         foreach (string s in tplItems) Tpl.Items.Add(s);
         Tpl.SelectedIndex = 0;
-        PolicyOff.Text = "Не проверять сложность пароля сервером"; PolicyOff.AutoSize = true;
+        PolicyOff.Text = "Не проверять сложность пароля сервером"; PolicyOff.AutoSize = true; PolicyOff.Checked = Cfg.PolicyOff;
 
         var tl = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(20) };
         tl.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -1275,19 +1561,23 @@ class CreateResult { public bool Ok; public string Msg; public bool NewLogin; }
 
 static class Csv
 {
+    public static Encoding Enc()
+    {
+        switch (Cfg.CsvEnc) { case "utf8": return new UTF8Encoding(false); case "cp1251": return Encoding.GetEncoding(1251); default: return new UTF8Encoding(true); }
+    }
     static string Cell(object v)
     {
-        if (v is bool) return (bool)v ? "+" : "";
+        if (v is bool) return (bool)v ? Cfg.CsvMark : "";
         string s = v == null ? "" : Convert.ToString(v);
         s = s.Replace("\r", " ").Replace("\n", " ");
-        if (s.IndexOfAny(new[] { ';', '"' }) >= 0) s = "\"" + s.Replace("\"", "\"\"") + "\"";
+        if (s.IndexOfAny(new[] { Cfg.CsvDelim[0], '"', '\r', '\n' }) >= 0) s = "\"" + s.Replace("\"", "\"\"") + "\"";
         return s;
     }
     public static string Line(IEnumerable<string> cells)
     {
         var l = new List<string>();
         foreach (string c in cells) l.Add(Cell(c));
-        return string.Join(";", l.ToArray());
+        return string.Join(Cfg.CsvDelim, l.ToArray());
     }
     // только видимые строки и столбцы (учитывает фильтры), разделитель «;» и BOM — открывается в Excel
     public static int Write(DataGridView g, string path)
@@ -1304,9 +1594,9 @@ static class Csv
             var cells = new List<object>();
             var one = new List<string>();
             foreach (var c in cols) one.Add(Cell(r.Cells[c.Index].Value).Replace("\u0001", ""));
-            sb.AppendLine(string.Join(";", one.ToArray())); n++;
+            sb.AppendLine(string.Join(Cfg.CsvDelim, one.ToArray())); n++;
         }
-        File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+        File.WriteAllText(path, sb.ToString(), Enc());
         return n;
     }
     public static void WriteRows(string[] header, List<string[]> rows, string path)
@@ -1314,7 +1604,7 @@ static class Csv
         var sb = new StringBuilder();
         sb.AppendLine(Line(header));
         foreach (string[] r in rows) sb.AppendLine(Line(r));
-        File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+        File.WriteAllText(path, sb.ToString(), Enc());
     }
     public static string Ask(string name)
     {
@@ -1471,7 +1761,7 @@ class BulkForm : Form
         foreach (string n in names)
         {
             bool win = n.IndexOf('\\') >= 0;
-            string pwd = win ? "" : App.GenPwd(8);
+            string pwd = win ? "" : App.GenPwd(Cfg.PwdLen);
             CreateResult r = worker(n, pwd, off, tpl);
             string shown = r.NewLogin ? (win ? "(Windows)" : pwd) : "—";
             string status = (r.Ok ? "OK: " : "Ошибка: ") + r.Msg;
@@ -1591,7 +1881,7 @@ class UsersTab : Panel
     // --- создание ---
     string[] TplFiles()
     {
-        try { string d = Path.Combine(App.Dir, "templates"); return Directory.Exists(d) ? Directory.GetFiles(d, "*.tpl") : new string[0]; }
+        try { string d = App.TemplatesDir; return Directory.Exists(d) ? Directory.GetFiles(d, "*.tpl") : new string[0]; }
         catch { return new string[0]; }
     }
 
@@ -1790,7 +2080,7 @@ WHERE m.member_principal_id=USER_ID(@u) AND r.name NOT IN ('db_owner','db_access
     {
         string kind = tplItem.Substring(0, tplItem.IndexOf(':')), nm = tplItem.Substring(tplItem.IndexOf(": ") + 2);
         List<string> lines = kind == "Шаблон"
-            ? new List<string>(File.ReadAllLines(Path.Combine(Path.Combine(App.Dir, "templates"), nm + ".tpl"), Encoding.UTF8))
+            ? new List<string>(File.ReadAllLines(Path.Combine(App.TemplatesDir, nm + ".tpl"), Encoding.UTF8))
             : UserTpl(nm);
         if (db.Kind != "mssql") { ApplyTplOther(user, lines); return; }
         var okPerm = new List<string>(new[] { "SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE" });
@@ -1824,7 +2114,7 @@ WHERE m.member_principal_id=USER_ID(@u) AND r.name NOT IN ('db_owner','db_access
         foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
         try
         {
-            string d = Path.Combine(App.Dir, "templates"); Directory.CreateDirectory(d);
+            string d = App.TemplatesDir; Directory.CreateDirectory(d);
             string f = Path.Combine(d, name + ".tpl");
             if (File.Exists(f) && !UI.Ask("Шаблон уже есть. Перезаписать?")) return;
             var l = UserTpl(it.Name);
@@ -1929,7 +2219,7 @@ class Matrix : Panel
 
     Db db; string[] types, perms;
     DataGridView g = new DataGridView();
-    FlatCombo cp = new FlatCombo();
+    FlatCombo cp = new FlatCombo(); Label lp = new Label(); int lastSel;
     HintBox tf = new HintBox(), tfU = new HintBox();
     CheckPicker objPick = new CheckPicker("Список объектов"), userPick = new CheckPicker("Список пользователей");
     FlatCombo cs = new FlatCombo(), cm = new FlatCombo();
@@ -1982,20 +2272,24 @@ class Matrix : Panel
 
         // строка 1: фильтры, строка 2: действия (слева основные, справа вторичные)
         var filters = FlowRow(); filters.Dock = DockStyle.Top; filters.Padding = new Padding(0, 4, 0, 2);
-        if (perms != null && perms.Length > 1)
+        lp.Text = "Право:"; lp.AutoSize = true; lp.Margin = new Padding(0, 9, 6, 3);
+        cp.Width = 120; cp.Margin = new Padding(0, 3, 12, 3);
+        cp.SelectedIndexChanged += delegate
         {
-            cp.Items.AddRange(perms); cp.SelectedIndex = 0; cp.Width = 90; cp.Margin = new Padding(0, 3, 8, 3);
-            cp.SelectedIndexChanged += delegate { if (!loading && ConfirmDrop()) Fill(); };
-            filters.Controls.Add(cp);
-        }
-        tf.Width = 230; tf.Margin = new Padding(0, 4, 8, 3); tf.Hint = "Поиск объектов…";
+            if (loading) return;
+            if (!ConfirmDrop()) { loading = true; cp.SelectedIndex = lastSel; loading = false; return; }
+            lastSel = cp.SelectedIndex; Fill();
+        };
+        filters.Controls.Add(lp); filters.Controls.Add(cp);
+        SetPerms(perms);
+        tf.Width = 200; tf.Margin = new Padding(0, 4, 8, 3); tf.Hint = "Поиск объектов…";
         tf.TextChanged += delegate { Filter(); }; filters.Controls.Add(tf);
         objPick.Margin = new Padding(0, 3, 8, 3); objPick.Changed += Filter; filters.Controls.Add(objPick);
         cs.Width = 130; cs.Margin = new Padding(0, 3, 8, 3); cs.SelectedIndexChanged += delegate { Filter(); }; filters.Controls.Add(cs);
         cm.Width = 160; cm.Margin = new Padding(0, 3, 24, 3);
         cm.Items.AddRange(new object[] { "Все", "Выдано кому-то", "Не выдано никому", "Изменённые" }); cm.SelectedIndex = 0;
         cm.SelectedIndexChanged += delegate { Filter(); }; filters.Controls.Add(cm);
-        tfU.Width = 200; tfU.Margin = new Padding(0, 4, 8, 3); tfU.Hint = "Поиск пользователей…";
+        tfU.Width = 180; tfU.Margin = new Padding(0, 4, 8, 3); tfU.Hint = "Поиск пользователей…";
         tfU.TextChanged += delegate { FilterCols(); }; filters.Controls.Add(tfU);
         userPick.Margin = new Padding(0, 3, 0, 3); userPick.Changed += FilterCols; filters.Controls.Add(userPick);
 
@@ -2057,7 +2351,7 @@ class Matrix : Panel
             AddCol("Объект", 300, true); AddCol("Все", 64, true); AddCol("Описание", 300, true);
             g.Columns[1].Tag = "nocsv"; g.Columns[1].ToolTipText = "Выдать или снять право всем пользователям в этой строке";
             g.Columns[2].DisplayIndex = 1;   // описание — сразу после имени объекта
-            g.Columns[2].Visible = objs.Exists(delegate(Obj o) { return o.Descr.Length > 0; });
+            g.Columns[2].Visible = Cfg.ShowDescr && objs.Exists(delegate(Obj o) { return o.Descr.Length > 0; });
             foreach (Usr u in usrs)
             {
                 var c = new DataGridViewCheckBoxColumn { HeaderText = u.Head, Width = 124, ReadOnly = true, Tag = u.Pid, SortMode = DataGridViewColumnSortMode.NotSortable };
@@ -2074,6 +2368,23 @@ class Matrix : Panel
         }
         catch (Exception ex) { App.Log("Ошибка загрузки: " + ex.Message); UI.Warn(ex.Message); }
         finally { loading = false; Cursor = Cursors.Default; }
+    }
+
+    // какие права показывает эта вкладка (из настроек); одно право — выбор скрыт
+    public void SetPerms(string[] p)
+    {
+        perms = p;
+        bool old = loading; loading = true;
+        string prev = cp.SelectedItem as string;
+        cp.Items.Clear();
+        if (p != null)
+        {
+            cp.Items.AddRange(p);
+            cp.SelectedIndex = prev != null && cp.Items.Contains(prev) ? cp.Items.IndexOf(prev) : 0;
+        }
+        lastSel = cp.SelectedIndex; loading = old;
+        cp.Visible = lp.Visible = p != null && p.Length > 1;
+        Stale = true;
     }
 
     void AddCol(string h, int w, bool ro)
@@ -2400,7 +2711,7 @@ class Matrix : Panel
         }
         if (addU.Count > 0 && !UI.Ask("Эти логины ещё не добавлены в базу «" + db.Name + "»:\n  " + string.Join(", ", addU.ToArray()) + "\n\nДобавить их как пользователей БД и выдать права?")) return;
         string how = db.D.Transactional ? "Всё выполняется одной транзакцией — при ошибке откат." : "При ошибке уже выполненные команды будут отменены обратными командами.";
-        if (!UI.Ask("Применить изменений: " + stm.Count + "?\n" + how)) return;
+        if (Cfg.ConfirmApply && !UI.Ask("Применить изменений: " + stm.Count + "?\n" + how)) return;
         var allStm = new List<string>(); var allInv = new List<string>();
         foreach (string n in addU) { allStm.Add("CREATE USER " + App.Q(n) + " FOR LOGIN " + App.Q(n)); allInv.Add("DROP USER " + App.Q(n)); }
         allStm.AddRange(stm); allInv.AddRange(inv);
@@ -2423,7 +2734,7 @@ class Matrix : Panel
         for (int i = History.Stack.Count - 1; i >= 0; i--) if (History.Stack[i].Db == db.Name) { it = History.Stack[i]; break; }
         if (it == null) { UI.Info("Откатывать нечего: в этой сессии для базы «" + db.Name + "» изменений не применялось."); return; }
         if (pend.Count > 0 && !ConfirmDrop()) return;
-        if (!UI.Ask("Откатить применение: " + it.Title + "?\nБудет выполнено команд: " + it.Sql.Count + (db.D.Transactional ? " (одной транзакцией)." : "."))) return;
+        if (Cfg.ConfirmUndo && !UI.Ask("Откатить применение: " + it.Title + "?\nБудет выполнено команд: " + it.Sql.Count + (db.D.Transactional ? " (одной транзакцией)." : "."))) return;
         try
         {
             db.Batch(it.Sql, null);
@@ -2497,9 +2808,9 @@ class MainForm : Form
 
         users = new UsersTab(db);
         AddPage("Пользователи", users);
-        AddMat("Представления (SELECT)", new Matrix(db, new[] { "V" }, new[] { "SELECT" }));
+        AddMat(Cap("Представления", Cfg.ViewPerms), new Matrix(db, new[] { "V" }, Cfg.ViewPerms.ToArray()));
         AddMat("Функции и процедуры (EXECUTE)", new Matrix(db, new[] { "P", "PC", "FN", "IF", "TF", "FS", "FT", "AF" }, null));
-        AddMat("Таблицы (SELECT)", new Matrix(db, new[] { "U" }, new[] { "SELECT" }));
+        AddMat(Cap("Таблицы", Cfg.TablePerms), new Matrix(db, new[] { "U" }, Cfg.TablePerms.ToArray()));
 
         body.Dock = DockStyle.Fill; body.Padding = new Padding(12, 4, 12, 8);
         strip.Dock = DockStyle.Top; strip.AutoSize = true; strip.Padding = new Padding(12, 8, 12, 4);
@@ -2520,7 +2831,12 @@ class MainForm : Form
             Theme.Toggle(); Theme.Apply(this); bTheme.Text = Theme.Label;
             foreach (var m in mats) m.Recolor();
         };
-        hdr.Controls.Add(bSw); hdr.Controls.Add(bTheme);
+        var bSet = new Button { Text = "Настройки", AutoSize = true };
+        bSet.Click += delegate
+        {
+            using (var sf = new SettingsForm()) if (sf.ShowDialog(this) == DialogResult.OK) ApplySettings();
+        };
+        hdr.Controls.Add(bSw); hdr.Controls.Add(bSet); hdr.Controls.Add(bTheme);
         Controls.Add(split); Controls.Add(hdr);
 
         App.OnLog += AppendLog;
@@ -2542,6 +2858,20 @@ class MainForm : Form
 
     void AppendLog(string s) { log.AppendText(s + "\r\n"); }
 
+    static string Cap(string title, List<string> perms) { return perms.Count == 1 ? title + " (" + perms[0] + ")" : title; }
+    int cur;
+
+    // применить новые настройки к открытому окну (тема, права на вкладках, колонка «Описание»)
+    void ApplySettings()
+    {
+        Theme.Init(Cfg.IsDark()); Theme.Apply(this); bTheme.Text = Theme.Label;
+        foreach (var m in mats) m.Recolor();
+        mats[0].SetPerms(Cfg.ViewPerms.ToArray()); mats[2].SetPerms(Cfg.TablePerms.ToArray());
+        foreach (var m in mats) m.Stale = true;
+        tabBtns[1].Text = Cap("Представления", Cfg.ViewPerms); tabBtns[3].Text = Cap("Таблицы", Cfg.TablePerms);
+        Select(cur);
+    }
+
     void AddPage(string t, Control c)
     {
         c.Dock = DockStyle.Fill; c.Visible = false; body.Controls.Add(c);
@@ -2555,6 +2885,7 @@ class MainForm : Form
 
     void Select(int i)
     {
+        cur = i;
         for (int j = 0; j < pages.Count; j++)
         {
             pages[j].Visible = j == i;
@@ -2573,7 +2904,7 @@ static class Program
     {
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Theme.Init(App.LoadIni().ContainsKey("theme") && App.LoadIni()["theme"] == "dark");
+        Cfg.Load(); App.PurgeLogs(); Theme.Init(Cfg.IsDark());
         App.Log("=== запуск ===");
         while (true)
         {
