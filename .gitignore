@@ -1,0 +1,5 @@
+LoginChanger.exe
+logs/
+templates/
+loginchanger.ini
+*.csv
