@@ -13,7 +13,7 @@
 ![SQL Server](https://img.shields.io/badge/SQL%20Server-2012%E2%80%932022-cc2927)
 ![Firebird](https://img.shields.io/badge/Firebird-3%2B-f40f02)
 ![MySQL](https://img.shields.io/badge/MySQL-8-00758f)
-![Size](https://img.shields.io/badge/%D1%80%D0%B0%D0%B7%D0%BC%D0%B5%D1%80-135%20%D0%9A%D0%91-16a34a)
+![Size](https://img.shields.io/badge/%D1%80%D0%B0%D0%B7%D0%BC%D0%B5%D1%80-150%20%D0%9A%D0%91-16a34a)
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 [**⬇ Скачать**](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe) ·
@@ -117,6 +117,6 @@ Pull request'ы и баг-репорты приветствуются: опиш�
 
 ## English
 
-**LoginChanger** is a portable (≈135 KB, single `.exe`, no installer, no extra drivers) Windows tool for managing **SQL Server users and permissions through a checkbox matrix**: rows are views / procedures / tables, columns are users. It supports bulk user creation with generated passwords, templates, one-click undo, orphaned-user repair (even when the Windows account no longer exists), filters, CSV export and light/dark themes. All changes are applied in a single transaction; `sa`, `dbo`, sysadmins and db_owners are never touched.
+**LoginChanger** is a portable (≈150 KB, single `.exe`, no installer, no extra drivers) Windows tool for managing **SQL Server users and permissions through a checkbox matrix**: rows are views / procedures / tables, columns are users. It supports bulk user creation with generated passwords, templates, one-click undo, orphaned-user repair (even when the Windows account no longer exists), filters, CSV export and light/dark themes. All changes are applied in a single transaction; `sa`, `dbo`, sysadmins and db_owners are never touched.
 
 **Download:** [LoginChanger.exe](https://github.com/MerdanOchanov/LoginChanger/releases/latest/download/LoginChanger.exe) · **Requirements:** Windows 7 SP1–11 / Server 2019 with .NET Framework 4.0+, SQL Server 2012–2022 admin login. **Build:** run `build.bat`. **License:** MIT. Besides SQL Server it works with **Firebird 3+** and **MySQL 8** through the ODBC drivers already installed in Windows; PostgreSQL is on the roadmap.
